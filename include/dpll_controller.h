@@ -55,4 +55,16 @@ float update(float phaseErrorDeg, float dtSeconds);
 // Return the last output voltage in volts.
 float lastVoltage();
 
+// Disable the loop and force the DAC to minVoltage (0 V). Use on power-off.
+void shutdown();
+
+// Disable the loop and force the DAC to a fixed voltage (manual control).
+void manualSet(float voltage);
+
+// Current configuration getters (for UART status/tuning).
+float getKp();
+float getKi();
+float getCenterVoltage();
+float getTargetPhase();
+
 } // namespace dpll

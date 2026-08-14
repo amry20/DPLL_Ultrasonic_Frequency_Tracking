@@ -131,4 +131,27 @@ float lastVoltage()
   return s_outputVoltage;
 }
 
+void shutdown()
+{
+  s_enabled = false;
+  s_integral = 0.0f;
+  s_outputVoltage = s_minVoltage;
+  dac::setVoltage(s_outputVoltage);
+}
+
+void manualSet(float voltage)
+{
+  s_enabled = false;
+  s_integral = 0.0f;
+  if (voltage < s_minVoltage) { voltage = s_minVoltage; }
+  if (voltage > s_maxVoltage) { voltage = s_maxVoltage; }
+  s_outputVoltage = voltage;
+  dac::setVoltage(s_outputVoltage);
+}
+
+float getKp()            { return s_kp; }
+float getKi()            { return s_ki; }
+float getCenterVoltage() { return s_centerVoltage; }
+float getTargetPhase()   { return s_targetPhaseDeg; }
+
 } // namespace dpll

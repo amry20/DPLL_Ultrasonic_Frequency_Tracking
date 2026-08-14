@@ -52,6 +52,9 @@ constexpr float kLoopDt = 0.01f; // 10 ms control interval
 // Phase error (absolute degrees) below which the loop is considered "LOCK".
 constexpr float kLockThresholdDeg = 5.0f;
 
+// Manual mode: when true, the DPLL loop is disengaged and the DAC is set by hand.
+static bool g_manualMode = false;
+
 void setup() {
   Serial.setTx(PA9);
   Serial.setRx(PA10);
@@ -75,7 +78,7 @@ void setup() {
   dpll::setOutputLimits(0.0f, 3.3f);
 
   Serial.println(F("DPLL Ultrasonic Frequency Tracking"));
-  Serial.println(F("Commands: \"dac <volt>\" to set DAC voltage (0.0 - 3.3), e.g. \"dac 1.2\""));
+  Serial.println(F("Type \"help\" for commands."));
 }
 
 void loop() {
@@ -89,14 +92,22 @@ void loop() {
     lastControl = nowMs;
 
     phase_capture::CaptureData data = phase_capture::getData();
-    if (data.valid) {
-      // Re-enable the loop in case it was held while waiting for ZCD.
+
+    static bool wasValid = false;
+    if (g_manualMode) {
+      // Manual control: keep DAC as the user set it; do not run the loop.
+    } else if (data.valid) {
+      if (!wasValid) {
+        // Re-acquire: restart from center voltage for a clean lock.
+        dpll::reset();
+      }
       dpll::enable(true);
       dpll::update(data.phaseDiffDeg, kLoopDt);
     } else {
-      // REF or ZCD missing -> hold output (controller keeps last voltage)
-      dpll::enable(false);
+      // Power off / signal missing -> drive DAC to 0 V.
+      dpll::shutdown();
     }
+    wasValid = data.valid;
   }
 
   // --- Status print (500 ms) ---
@@ -105,28 +116,108 @@ void loop() {
     lastPrint = millis();
 
     phase_capture::CaptureData data = phase_capture::getData();
+    const char* manual = g_manualMode ? " [MANUAL]" : "";
     if (data.valid) {
       float absPhase = data.phaseDiffDeg < 0.0f ? -data.phaseDiffDeg : data.phaseDiffDeg;
       const char* state = (absPhase <= kLockThresholdDeg) ? "LOCK" : "TRACK";
-      Serial.printf("%s | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
-                    state,
+      Serial.printf("%s%s | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
+                    state, manual,
                     data.frequencyHz,
                     data.phaseDiffDeg,
                     phase_capture::ticksToUs(data.periodTicks),
                     dac::lastRaw() * (3.3f / 4095.0f));
     } else if (data.refValid && !data.zcdPresent) {
-      Serial.printf("WAIT ZCD | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing | DAC: %.2f V\n",
+      Serial.printf("WAIT ZCD%s | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing | DAC: %.2f V\n",
+                    manual,
                     data.frequencyHz,
                     dac::lastRaw() * (3.3f / 4095.0f));
     } else {
-      Serial.printf("NO REF SIGNAL | Waiting for generator input on PA0... | DAC: %.2f V\n",
+      Serial.printf("NO REF SIGNAL%s | Waiting for generator input on PA0... | DAC: %.2f V\n",
+                    manual,
                     dac::lastRaw() * (3.3f / 4095.0f));
     }
   }
 }
 
-// UART command parser: "dac <voltage>" sets DAC output voltage (0.0 - 3.3 V)
-// Non-blocking: processes at most ONE character per call, so other code keeps running.
+// Parse and execute one full command line (already trimmed).
+void handleCommand(const String& cmd) {
+  int sp = cmd.indexOf(' ');
+  String name = (sp < 0) ? cmd : cmd.substring(0, sp);
+  String arg  = (sp < 0) ? ""  : cmd.substring(sp + 1);
+  name.trim();
+  arg.trim();
+
+  if (name == "help" || name == "?") {
+    Serial.println(F("Commands:"));
+    Serial.println(F("  dac <volt>    : manual DAC voltage (0.0-3.3), disables loop"));
+    Serial.println(F("  kp <val>      : set proportional gain (V/deg)"));
+    Serial.println(F("  ki <val>      : set integral gain (V/deg/s)"));
+    Serial.println(F("  center <volt> : set center voltage"));
+    Serial.println(F("  target <deg>  : set lock phase (deg)"));
+    Serial.println(F("  gain          : show current gains"));
+    Serial.println(F("  reset         : clear integrator, restart from center"));
+    Serial.println(F("  run           : re-enable control loop"));
+  }
+  else if (name == "dac") {
+    if (arg.length() == 0) {
+      Serial.printf("DAC now: %.3f V\n", dac::lastRaw() * (3.3f / 4095.0f));
+      return;
+    }
+    float v = arg.toFloat();
+    if (v >= 0.0f && v <= 3.3f) {
+      g_manualMode = true;
+      dpll::manualSet(v);
+      Serial.printf("DAC set to %.2f V (raw %u) - loop disabled\n", v, dac::lastRaw());
+    } else {
+      Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
+    }
+  }
+  else if (name == "kp") {
+    float v = arg.toFloat();
+    dpll::setGains(v, dpll::getKi());
+    Serial.printf("Kp = %.5f V/deg\n", v);
+  }
+  else if (name == "ki") {
+    float v = arg.toFloat();
+    dpll::setGains(dpll::getKp(), v);
+    Serial.printf("Ki = %.5f V/deg/s\n", v);
+  }
+  else if (name == "center") {
+    float v = arg.toFloat();
+    if (v >= 0.0f && v <= 3.3f) {
+      dpll::begin(v, dpll::getKp(), dpll::getKi());
+      Serial.printf("Center = %.2f V\n", v);
+    } else {
+      Serial.println("ERR: out of range (0.0 - 3.3 V)");
+    }
+  }
+  else if (name == "target") {
+    float v = arg.toFloat();
+    dpll::setTargetPhase(v);
+    Serial.printf("Target phase = %.2f deg\n", v);
+  }
+  else if (name == "gain") {
+    Serial.printf("Kp=%.5f V/deg | Ki=%.5f V/deg/s | center=%.2f V | target=%.2f deg | manual=%s\n",
+                  dpll::getKp(), dpll::getKi(), dpll::getCenterVoltage(),
+                  dpll::getTargetPhase(), g_manualMode ? "yes" : "no");
+  }
+  else if (name == "reset") {
+    g_manualMode = false;
+    dpll::reset();
+    dpll::enable(true);
+    Serial.println("Controller reset to center voltage, loop enabled");
+  }
+  else if (name == "run") {
+    g_manualMode = false;
+    dpll::enable(true);
+    Serial.println("Control loop enabled");
+  }
+  else {
+    Serial.println("ERR: Unknown command. Type \"help\".");
+  }
+}
+
+// UART command parser (non-blocking: one char per call).
 void processSerialCommand() {
   static String cmd = "";
 
@@ -138,17 +229,7 @@ void processSerialCommand() {
   if (c == '\n') {
     cmd.trim();
     if (cmd.length() > 0) {
-      if (cmd.startsWith("dac")) {
-        float volt = cmd.substring(4).toFloat();
-        if (volt >= 0.0f && volt <= 3.3f) {
-          dac::setVoltage(volt);
-          Serial.printf("DAC set to %.2f V (raw %u)\n", volt, dac::lastRaw());
-        } else {
-          Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
-        }
-      } else {
-        Serial.println("ERR: Unknown command. Usage: \"dac <volt>\"");
-      }
+      handleCommand(cmd);
     }
     cmd = "";
   } else if (c != '\r') {
