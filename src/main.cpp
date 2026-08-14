@@ -47,8 +47,11 @@ extern "C" void SystemClock_Config(void)
 void heartbeat();
 void processSerialCommand();
 
-// DPLL loop update period (seconds)
-constexpr float kLoopDt = 0.01f; // 10 ms control interval
+// DPLL control loop period in milliseconds (runtime-configurable via "loop <ms>").
+// Must be long enough for the high-Q transducer to settle after each DAC step:
+//   settling time tau ~ Q / (2*pi*f0); choose period >= ~5 * tau.
+// Default 20 ms is a safe starting point for typical ultrasonic transducers.
+static uint32_t g_loopPeriodMs = 20;
 // Phase error (absolute nanoseconds) below which the loop is considered "LOCK".
 constexpr float kLockThresholdNs = 500.0f;
 
@@ -92,10 +95,10 @@ void loop() {
   heartbeat();
   processSerialCommand();
 
-  // --- DPLL control loop (fixed 10 ms rate, non-blocking) ---
+  // --- DPLL control loop (fixed rate, non-blocking) ---
   static uint32_t lastControl = 0;
   uint32_t nowMs = millis();
-  if (nowMs - lastControl >= (uint32_t)(kLoopDt * 1000.0f)) {
+  if (nowMs - lastControl >= g_loopPeriodMs) {
     lastControl = nowMs;
 
     phase_capture::CaptureData data = phase_capture::getData();
@@ -109,7 +112,7 @@ void loop() {
         dpll::reset();
       }
       dpll::enable(true);
-      dpll::update(data.phaseDiffNs, kLoopDt);
+      dpll::update(data.phaseDiffNs, g_loopPeriodMs * 0.001f);
     } else {
       // Power off / signal missing -> drive DAC to 0 V.
       dpll::shutdown();
@@ -162,6 +165,7 @@ void handleCommand(const String& cmd) {
     Serial.println(F("  center <volt> : set center voltage"));
     Serial.println(F("  target <ns>   : set lock delay (ns)"));
     Serial.println(F("  slew <V/s>    : set max DAC slew rate (V/s)"));
+    Serial.println(F("  loop <ms>     : set control loop period (ms)"));
     Serial.println(F("  gain          : show current gains"));
     Serial.println(F("  reset         : clear integrator, restart from center"));
     Serial.println(F("  run           : re-enable control loop"));
@@ -216,6 +220,15 @@ void handleCommand(const String& cmd) {
       Serial.printf("Max slew = %.1f V/s\n", v);
     } else {
       Serial.println("ERR: slew must be > 0 (V/s)");
+    }
+  }
+  else if (name == "loop") {
+    int v = arg.toInt();
+    if (v >= 1 && v <= 1000) {
+      g_loopPeriodMs = (uint32_t)v;
+      Serial.printf("Loop period = %u ms\n", g_loopPeriodMs);
+    } else {
+      Serial.println("ERR: loop period must be 1-1000 ms");
     }
   }
   else if (name == "reset") {
