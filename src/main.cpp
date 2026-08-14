@@ -72,8 +72,11 @@ void setup() {
   phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
 
   // Initialize DPLL PI controller.
-  // center 1.65 V, Kp = 0.01 V/deg, Ki = 0.5 V/deg/s (tune as needed).
-  dpll::begin(1.65f, 0.01f, 0.5f);
+  // center 1.65 V. NEGATIVE gains: with "phase = ZCD - REF" convention,
+  // positive phase (ZCD lag = VCO slow) must INCREASE voltage to speed the VCO.
+  //   error = target - phase  ->  positive phase gives negative error
+  //   voltage = center + Kp*error  ->  negative Kp => voltage RISES for lag.
+  dpll::begin(1.65f, -0.01f, -0.5f);
   dpll::setTargetPhase(0.0f);
   dpll::setOutputLimits(0.0f, 3.3f);
 
