@@ -38,10 +38,11 @@ extern "C" void SystemClock_Config(void)
         Error_Handler();
     }
 }
-#define HEARTBEAT_LED PC13
+#define HEARTBEAT_LED PA_6
 void heartbeat();
 void setup() {
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
+  digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH); // Turn off the LED initially (assuming active low)
 }
 
 void loop() {
