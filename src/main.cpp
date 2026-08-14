@@ -75,14 +75,15 @@ void setup() {
   phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
 
   // Initialize DPLL PI controller.
-  // center 1.65 V. NEGATIVE gains: with "phase = ZCD - REF" convention,
-  // positive delay (ZCD lag = VCO slow) must INCREASE voltage to speed the VCO.
-  //   error = target - phase  ->  positive delay gives negative error
-  //   voltage = center + Kp*error  ->  negative Kp => voltage RISES for lag.
+  // center 1.65 V. POSITIVE gains (polarity now corrected).
+  // Series resonance: below resonance -> current LEADS -> phase negative;
+  //                    above resonance -> current LAGS -> phase positive.
+  //   error = target - phase ; voltage = center + Kp*error
+  //   - phase positive (above res) -> error negative -> voltage DOWN -> freq down
+  //   - phase negative (below res) -> error positive -> voltage UP  -> freq up
   // Gains are V per nanosecond (Kp) and V/ns per second (Ki).
-  // Start small; tune up gradually. Typical order for a ~33 kHz VCO with
-  // ~2.5 kHz/V sensitivity: Kp ~ 2e-6 .. 1e-5 V/ns.
-  dpll::begin(1.65f, -0.000002f, -0.0002f);
+  // Start small; the phase slope near resonance is very steep for high-Q.
+  dpll::begin(1.65f, 0.000002f, 0.0002f);
   dpll::setTargetPhase(0.0f);
   dpll::setOutputLimits(0.0f, 3.3f);
   dpll::setMaxSlew(30.0f);
