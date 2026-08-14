@@ -47,7 +47,7 @@ void setup() {
 
   // DAC control output: PA4, mid-scale (about 1.65 V) on start.
   dac::begin();
-  dac::setVoltage(1.65f);
+  dac::setVoltage(0);
 }
 
 void loop() {
