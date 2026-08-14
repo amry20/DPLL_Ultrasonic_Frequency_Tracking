@@ -33,7 +33,7 @@ struct CaptureData {
   uint32_t zcdTimestamp;    // TIM2 tick count on ZCD edge
   uint32_t periodTicks;     // Reference signal period in TIM2 ticks
   int32_t  phaseDiffTicks;  // (ZCD - REF) wrapped to [-period/2 .. +period/2]
-  float    phaseDiffDeg;    // Phase difference in degrees [-180.0 .. +180.0]
+  float    phaseDiffNs;     // Phase difference as time delay ZCD vs REF (nanoseconds)
   float    frequencyHz;     // Measured reference frequency in Hz
   uint32_t captureCount;    // Incremented every reference edge
   uint32_t zcdCaptureCount; // Incremented every ZCD edge

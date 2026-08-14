@@ -163,7 +163,7 @@ CaptureData getData()
 
   if (!out.refValid || out.periodTicks == 0) {
     out.phaseDiffTicks = 0;
-    out.phaseDiffDeg   = 0.0f;
+    out.phaseDiffNs    = 0.0f;
     out.frequencyHz    = 0.0f;
     return out;
   }
@@ -174,7 +174,7 @@ CaptureData getData()
   if (!out.zcdPresent) {
     // ZCD not present/too old -> phase diff invalid
     out.phaseDiffTicks = 0;
-    out.phaseDiffDeg   = 0.0f;
+    out.phaseDiffNs    = 0.0f;
     return out;
   }
 
@@ -192,8 +192,9 @@ CaptureData getData()
 
   out.phaseDiffTicks = diff;
 
-  // 3) Convert phase diff to degrees [-180.0 .. +180.0]
-  out.phaseDiffDeg = (static_cast<float>(diff) / static_cast<float>(out.periodTicks)) * 360.0f;
+  // 3) Convert phase diff to nanoseconds (time delay ZCD vs REF).
+  //    Timer tick = 1/84 MHz ~= 11.9 ns.
+  out.phaseDiffNs = static_cast<float>(diff) * (1e9f / kTimerClockHz);
 
   return out;
 }

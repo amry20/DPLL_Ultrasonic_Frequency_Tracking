@@ -15,7 +15,7 @@ float s_kp = 0.0f;
 float s_ki = 0.0f;
 
 float s_centerVoltage = 1.65f;
-float s_targetPhaseDeg = 0.0f;
+float s_targetPhaseNs = 0.0f;
 
 float s_minVoltage = 0.0f;
 float s_maxVoltage = 3.3f;
@@ -24,18 +24,6 @@ float s_integral = 0.0f;
 float s_outputVoltage = 1.65f;
 
 bool s_enabled = true;
-
-// Wrap an angle to [-180, 180) degrees.
-float wrapDeg(float deg)
-{
-  while (deg >= 180.0f) {
-    deg -= 360.0f;
-  }
-  while (deg < -180.0f) {
-    deg += 360.0f;
-  }
-  return deg;
-}
 
 } // namespace
 
@@ -50,9 +38,9 @@ void begin(float centerVoltage, float kp, float ki)
   dac::setVoltage(s_outputVoltage);
 }
 
-void setTargetPhase(float targetDeg)
+void setTargetPhase(float targetNs)
 {
-  s_targetPhaseDeg = targetDeg;
+  s_targetPhaseNs = targetNs;
 }
 
 void setGains(float kp, float ki)
@@ -84,7 +72,7 @@ void reset()
   dac::setVoltage(s_outputVoltage);
 }
 
-float update(float phaseErrorDeg, float dtSeconds)
+float update(float phaseErrorNs, float dtSeconds)
 {
   if (!s_enabled) {
     return s_outputVoltage; // Hold last value
@@ -98,8 +86,9 @@ float update(float phaseErrorDeg, float dtSeconds)
     dtSeconds = 1.0f; // Cap at 1 s to avoid integral windup spikes
   }
 
-  // Wrap error to [-180, 180]
-  float error = wrapDeg(s_targetPhaseDeg - phaseErrorDeg);
+  // Error in nanoseconds. The capture layer already wraps the raw (ZCD - REF)
+  // time difference to [-period/2 .. +period/2], so no extra wrap is needed.
+  float error = s_targetPhaseNs - phaseErrorNs;
 
   // Proportional term
   float proportional = s_kp * error;
@@ -152,6 +141,6 @@ void manualSet(float voltage)
 float getKp()            { return s_kp; }
 float getKi()            { return s_ki; }
 float getCenterVoltage() { return s_centerVoltage; }
-float getTargetPhase()   { return s_targetPhaseDeg; }
+float getTargetPhase()   { return s_targetPhaseNs; }
 
 } // namespace dpll

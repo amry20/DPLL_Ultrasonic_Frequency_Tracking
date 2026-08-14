@@ -49,8 +49,8 @@ void processSerialCommand();
 
 // DPLL loop update period (seconds)
 constexpr float kLoopDt = 0.01f; // 10 ms control interval
-// Phase error (absolute degrees) below which the loop is considered "LOCK".
-constexpr float kLockThresholdDeg = 5.0f;
+// Phase error (absolute nanoseconds) below which the loop is considered "LOCK".
+constexpr float kLockThresholdNs = 500.0f;
 
 // Manual mode: when true, the DPLL loop is disengaged and the DAC is set by hand.
 static bool g_manualMode = false;
@@ -73,10 +73,11 @@ void setup() {
 
   // Initialize DPLL PI controller.
   // center 1.65 V. NEGATIVE gains: with "phase = ZCD - REF" convention,
-  // positive phase (ZCD lag = VCO slow) must INCREASE voltage to speed the VCO.
-  //   error = target - phase  ->  positive phase gives negative error
+  // positive delay (ZCD lag = VCO slow) must INCREASE voltage to speed the VCO.
+  //   error = target - phase  ->  positive delay gives negative error
   //   voltage = center + Kp*error  ->  negative Kp => voltage RISES for lag.
-  dpll::begin(1.65f, -0.01f, -0.5f);
+  // Gains are V per nanosecond (Kp) and V/ns per second (Ki).
+  dpll::begin(1.65f, -0.0001f, -0.005f);
   dpll::setTargetPhase(0.0f);
   dpll::setOutputLimits(0.0f, 3.3f);
 
@@ -105,7 +106,7 @@ void loop() {
         dpll::reset();
       }
       dpll::enable(true);
-      dpll::update(data.phaseDiffDeg, kLoopDt);
+      dpll::update(data.phaseDiffNs, kLoopDt);
     } else {
       // Power off / signal missing -> drive DAC to 0 V.
       dpll::shutdown();
@@ -121,12 +122,12 @@ void loop() {
     phase_capture::CaptureData data = phase_capture::getData();
     const char* manual = g_manualMode ? " [MANUAL]" : "";
     if (data.valid) {
-      float absPhase = data.phaseDiffDeg < 0.0f ? -data.phaseDiffDeg : data.phaseDiffDeg;
-      const char* state = (absPhase <= kLockThresholdDeg) ? "LOCK" : "TRACK";
-      Serial.printf("%s%s | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
+      float absPhase = data.phaseDiffNs < 0.0f ? -data.phaseDiffNs : data.phaseDiffNs;
+      const char* state = (absPhase <= kLockThresholdNs) ? "LOCK" : "TRACK";
+      Serial.printf("%s%s | Freq: %.2f Hz | Phase: %.1f ns | Period: %.2f us | DAC: %.2f V\n",
                     state, manual,
                     data.frequencyHz,
-                    data.phaseDiffDeg,
+                    data.phaseDiffNs,
                     phase_capture::ticksToUs(data.periodTicks),
                     dac::lastRaw() * (3.3f / 4095.0f));
     } else if (data.refValid && !data.zcdPresent) {
@@ -153,10 +154,10 @@ void handleCommand(const String& cmd) {
   if (name == "help" || name == "?") {
     Serial.println(F("Commands:"));
     Serial.println(F("  dac <volt>    : manual DAC voltage (0.0-3.3), disables loop"));
-    Serial.println(F("  kp <val>      : set proportional gain (V/deg)"));
-    Serial.println(F("  ki <val>      : set integral gain (V/deg/s)"));
+    Serial.println(F("  kp <val>      : set proportional gain (V/ns)"));
+    Serial.println(F("  ki <val>      : set integral gain (V/ns/s)"));
     Serial.println(F("  center <volt> : set center voltage"));
-    Serial.println(F("  target <deg>  : set lock phase (deg)"));
+    Serial.println(F("  target <ns>   : set lock delay (ns)"));
     Serial.println(F("  gain          : show current gains"));
     Serial.println(F("  reset         : clear integrator, restart from center"));
     Serial.println(F("  run           : re-enable control loop"));
@@ -178,12 +179,12 @@ void handleCommand(const String& cmd) {
   else if (name == "kp") {
     float v = arg.toFloat();
     dpll::setGains(v, dpll::getKi());
-    Serial.printf("Kp = %.5f V/deg\n", v);
+    Serial.printf("Kp = %.5f V/ns\n", v);
   }
   else if (name == "ki") {
     float v = arg.toFloat();
     dpll::setGains(dpll::getKp(), v);
-    Serial.printf("Ki = %.5f V/deg/s\n", v);
+    Serial.printf("Ki = %.5f V/ns/s\n", v);
   }
   else if (name == "center") {
     float v = arg.toFloat();
@@ -197,10 +198,10 @@ void handleCommand(const String& cmd) {
   else if (name == "target") {
     float v = arg.toFloat();
     dpll::setTargetPhase(v);
-    Serial.printf("Target phase = %.2f deg\n", v);
+    Serial.printf("Target phase = %.1f ns\n", v);
   }
   else if (name == "gain") {
-    Serial.printf("Kp=%.5f V/deg | Ki=%.5f V/deg/s | center=%.2f V | target=%.2f deg | manual=%s\n",
+    Serial.printf("Kp=%.5f V/ns | Ki=%.5f V/ns/s | center=%.2f V | target=%.1f ns | manual=%s\n",
                   dpll::getKp(), dpll::getKi(), dpll::getCenterVoltage(),
                   dpll::getTargetPhase(), g_manualMode ? "yes" : "no");
   }

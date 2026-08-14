@@ -9,7 +9,7 @@
  *
  * The controller is a standard PI loop:
  *
- *   error        = targetPhase - measuredPhase   (degrees, wrapped to [-180,180])
+ *   error        = targetDelay - measuredDelay   (nanoseconds)
  *   integral    += error * dt
  *   voltage      = centerVoltage + (Kp * error + Ki * integral)
  *
@@ -26,12 +26,12 @@ namespace dpll {
 
 // Initialize the controller.
 // centerVoltage : VCO voltage that produces the nominal/center frequency.
-// kp            : proportional gain (V per degree of phase error).
-// ki            : integral gain (V per degree per second).
+// kp            : proportional gain (V per nanosecond of phase error).
+// ki            : integral gain (V per nanosecond per second).
 void begin(float centerVoltage, float kp, float ki);
 
-// Set the phase the loop should lock onto, in degrees (default 0).
-void setTargetPhase(float targetDeg);
+// Set the phase delay the loop should lock onto, in nanoseconds (default 0).
+void setTargetPhase(float targetNs);
 
 // Update the PI gains at runtime.
 void setGains(float kp, float ki);
@@ -47,10 +47,10 @@ bool isEnabled();
 void reset();
 
 // Run one control step.
-// phaseErrorDeg : measured phase difference in degrees (from phase_capture).
-// dtSeconds     : time since the previous update call, in seconds.
+// phaseErrorNs : measured phase difference in nanoseconds (from phase_capture).
+// dtSeconds    : time since the previous update call, in seconds.
 // Returns the resulting output voltage in volts (already applied to the DAC).
-float update(float phaseErrorDeg, float dtSeconds);
+float update(float phaseErrorNs, float dtSeconds);
 
 // Return the last output voltage in volts.
 float lastVoltage();
