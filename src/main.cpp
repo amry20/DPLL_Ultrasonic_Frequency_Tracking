@@ -91,29 +91,33 @@ void loop() {
 }
 
 // UART command parser: "dac <voltage>" sets DAC output voltage (0.0 - 3.3 V)
+// Non-blocking: processes at most ONE character per call, so other code keeps running.
 void processSerialCommand() {
   static String cmd = "";
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n') {
-      cmd.trim();
-      if (cmd.length() > 0) {
-        if (cmd.startsWith("dac")) {
-          float volt = cmd.substring(4).toFloat();
-          if (volt >= 0.0f && volt <= 3.3f) {
-            dac::setVoltage(volt);
-            Serial.printf("DAC set to %.2f V (raw %u)\n", volt, dac::lastRaw());
-          } else {
-            Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
-          }
+
+  if (!Serial.available()) {
+    return; // Nothing to read, return immediately
+  }
+
+  char c = (char)Serial.read();
+  if (c == '\n') {
+    cmd.trim();
+    if (cmd.length() > 0) {
+      if (cmd.startsWith("dac")) {
+        float volt = cmd.substring(4).toFloat();
+        if (volt >= 0.0f && volt <= 3.3f) {
+          dac::setVoltage(volt);
+          Serial.printf("DAC set to %.2f V (raw %u)\n", volt, dac::lastRaw());
         } else {
-          Serial.println("ERR: Unknown command. Usage: \"dac <volt>\"");
+          Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
         }
+      } else {
+        Serial.println("ERR: Unknown command. Usage: \"dac <volt>\"");
       }
-      cmd = "";
-    } else if (c != '\r') {
-      cmd += c;
     }
+    cmd = "";
+  } else if (c != '\r') {
+    cmd += c;
   }
 }
 
