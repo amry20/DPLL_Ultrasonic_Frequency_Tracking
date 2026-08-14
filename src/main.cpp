@@ -49,6 +49,8 @@ void processSerialCommand();
 
 // DPLL loop update period (seconds)
 constexpr float kLoopDt = 0.01f; // 10 ms control interval
+// Phase error (absolute degrees) below which the loop is considered "LOCK".
+constexpr float kLockThresholdDeg = 5.0f;
 
 void setup() {
   Serial.setTx(PA9);
@@ -88,13 +90,12 @@ void loop() {
 
     phase_capture::CaptureData data = phase_capture::getData();
     if (data.valid) {
-      float outVolt = dpll::update(data.phaseDiffDeg, kLoopDt);
-      (void)outVolt;
-    } else if (!data.zcdPresent) {
-      // ZCD missing -> hold output (controller keeps last voltage)
-      dpll::enable(false);
-    } else {
+      // Re-enable the loop in case it was held while waiting for ZCD.
       dpll::enable(true);
+      dpll::update(data.phaseDiffDeg, kLoopDt);
+    } else {
+      // REF or ZCD missing -> hold output (controller keeps last voltage)
+      dpll::enable(false);
     }
   }
 
@@ -105,7 +106,10 @@ void loop() {
 
     phase_capture::CaptureData data = phase_capture::getData();
     if (data.valid) {
-      Serial.printf("LOCK | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
+      float absPhase = data.phaseDiffDeg < 0.0f ? -data.phaseDiffDeg : data.phaseDiffDeg;
+      const char* state = (absPhase <= kLockThresholdDeg) ? "LOCK" : "TRACK";
+      Serial.printf("%s | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
+                    state,
                     data.frequencyHz,
                     data.phaseDiffDeg,
                     phase_capture::ticksToUs(data.periodTicks),
