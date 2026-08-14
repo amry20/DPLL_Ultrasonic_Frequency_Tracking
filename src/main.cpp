@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "dac_output.h"
 extern "C" void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -43,6 +44,10 @@ void heartbeat();
 void setup() {
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH); // Turn off the LED initially (assuming active low)
+
+  // DAC control output: PA4, mid-scale (about 1.65 V) on start.
+  dac::begin();
+  dac::setVoltage(1.65f);
 }
 
 void loop() {
