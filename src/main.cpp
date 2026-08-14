@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "dac_output.h"
 #include "phase_capture.h"
+#include "dpll_controller.h"
 
 extern "C" void SystemClock_Config(void)
 {
@@ -46,6 +47,9 @@ extern "C" void SystemClock_Config(void)
 void heartbeat();
 void processSerialCommand();
 
+// DPLL loop update period (seconds)
+constexpr float kLoopDt = 0.01f; // 10 ms control interval
+
 void setup() {
   Serial.setTx(PA9);
   Serial.setRx(PA10);
@@ -62,6 +66,12 @@ void setup() {
   // PA1 = ZCD feedback input (Rising edge trigger)
   phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
 
+  // Initialize DPLL PI controller.
+  // center 1.65 V, Kp = 0.01 V/deg, Ki = 0.5 V/deg/s (tune as needed).
+  dpll::begin(1.65f, 0.01f, 0.5f);
+  dpll::setTargetPhase(0.0f);
+  dpll::setOutputLimits(0.0f, 3.3f);
+
   Serial.println(F("DPLL Ultrasonic Frequency Tracking"));
   Serial.println(F("Commands: \"dac <volt>\" to set DAC voltage (0.0 - 3.3), e.g. \"dac 1.2\""));
 }
@@ -70,6 +80,25 @@ void loop() {
   heartbeat();
   processSerialCommand();
 
+  // --- DPLL control loop (fixed 10 ms rate, non-blocking) ---
+  static uint32_t lastControl = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastControl >= (uint32_t)(kLoopDt * 1000.0f)) {
+    lastControl = nowMs;
+
+    phase_capture::CaptureData data = phase_capture::getData();
+    if (data.valid) {
+      float outVolt = dpll::update(data.phaseDiffDeg, kLoopDt);
+      (void)outVolt;
+    } else if (!data.zcdPresent) {
+      // ZCD missing -> hold output (controller keeps last voltage)
+      dpll::enable(false);
+    } else {
+      dpll::enable(true);
+    }
+  }
+
+  // --- Status print (500 ms) ---
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 500) {
     lastPrint = millis();
