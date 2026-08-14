@@ -39,6 +39,10 @@ void setGains(float kp, float ki);
 // Clamp the DAC output to [minV, maxV] volts (default 0.0 .. 3.3).
 void setOutputLimits(float minV, float maxV);
 
+// Limit the maximum DAC change rate (V/s). Prevents violent slamming when
+// gains are misconfigured. Default 30 V/s (0.3 V per 10 ms step).
+void setMaxSlew(float voltsPerSecond);
+
 // Enable or disable the control loop. When disabled, output holds last value.
 void enable(bool on);
 bool isEnabled();
@@ -66,5 +70,6 @@ float getKp();
 float getKi();
 float getCenterVoltage();
 float getTargetPhase();
+float getMaxSlew();
 
 } // namespace dpll

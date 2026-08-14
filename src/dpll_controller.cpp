@@ -22,6 +22,7 @@ float s_maxVoltage = 3.3f;
 
 float s_integral = 0.0f;
 float s_outputVoltage = 1.65f;
+float s_maxSlew = 30.0f; // V/s
 
 bool s_enabled = true;
 
@@ -53,6 +54,14 @@ void setOutputLimits(float minV, float maxV)
 {
   s_minVoltage = minV;
   s_maxVoltage = maxV;
+}
+
+void setMaxSlew(float voltsPerSecond)
+{
+  if (voltsPerSecond <= 0.0f) {
+    voltsPerSecond = 30.0f;
+  }
+  s_maxSlew = voltsPerSecond;
 }
 
 void enable(bool on)
@@ -109,6 +118,17 @@ float update(float phaseErrorNs, float dtSeconds)
     s_integral = s_minVoltage - s_centerVoltage - proportional;
   }
 
+  // Slew-rate limit: cap how much the DAC can move per step, and back off the
+  // integrator consistently so it does not wind up during a slow ramp.
+  float maxStep = s_maxSlew * dtSeconds;
+  if (voltage - s_outputVoltage > maxStep) {
+    voltage = s_outputVoltage + maxStep;
+    s_integral = voltage - s_centerVoltage - proportional;
+  } else if (s_outputVoltage - voltage > maxStep) {
+    voltage = s_outputVoltage - maxStep;
+    s_integral = voltage - s_centerVoltage - proportional;
+  }
+
   s_outputVoltage = voltage;
   dac::setVoltage(s_outputVoltage);
 
@@ -142,5 +162,6 @@ float getKp()            { return s_kp; }
 float getKi()            { return s_ki; }
 float getCenterVoltage() { return s_centerVoltage; }
 float getTargetPhase()   { return s_targetPhaseNs; }
+float getMaxSlew()       { return s_maxSlew; }
 
 } // namespace dpll

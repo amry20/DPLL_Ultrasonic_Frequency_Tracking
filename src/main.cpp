@@ -77,9 +77,12 @@ void setup() {
   //   error = target - phase  ->  positive delay gives negative error
   //   voltage = center + Kp*error  ->  negative Kp => voltage RISES for lag.
   // Gains are V per nanosecond (Kp) and V/ns per second (Ki).
-  dpll::begin(1.65f, -0.0001f, -0.005f);
+  // Start small; tune up gradually. Typical order for a ~33 kHz VCO with
+  // ~2.5 kHz/V sensitivity: Kp ~ 2e-6 .. 1e-5 V/ns.
+  dpll::begin(1.65f, -0.000002f, -0.0002f);
   dpll::setTargetPhase(0.0f);
   dpll::setOutputLimits(0.0f, 3.3f);
+  dpll::setMaxSlew(30.0f);
 
   Serial.println(F("DPLL Ultrasonic Frequency Tracking"));
   Serial.println(F("Type \"help\" for commands."));
@@ -158,6 +161,7 @@ void handleCommand(const String& cmd) {
     Serial.println(F("  ki <val>      : set integral gain (V/ns/s)"));
     Serial.println(F("  center <volt> : set center voltage"));
     Serial.println(F("  target <ns>   : set lock delay (ns)"));
+    Serial.println(F("  slew <V/s>    : set max DAC slew rate (V/s)"));
     Serial.println(F("  gain          : show current gains"));
     Serial.println(F("  reset         : clear integrator, restart from center"));
     Serial.println(F("  run           : re-enable control loop"));
@@ -201,9 +205,18 @@ void handleCommand(const String& cmd) {
     Serial.printf("Target phase = %.1f ns\n", v);
   }
   else if (name == "gain") {
-    Serial.printf("Kp=%.5f V/ns | Ki=%.5f V/ns/s | center=%.2f V | target=%.1f ns | manual=%s\n",
+    Serial.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s\n",
                   dpll::getKp(), dpll::getKi(), dpll::getCenterVoltage(),
-                  dpll::getTargetPhase(), g_manualMode ? "yes" : "no");
+                  dpll::getTargetPhase(), dpll::getMaxSlew(), g_manualMode ? "yes" : "no");
+  }
+  else if (name == "slew") {
+    float v = arg.toFloat();
+    if (v > 0.0f) {
+      dpll::setMaxSlew(v);
+      Serial.printf("Max slew = %.1f V/s\n", v);
+    } else {
+      Serial.println("ERR: slew must be > 0 (V/s)");
+    }
   }
   else if (name == "reset") {
     g_manualMode = false;
