@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "dac_output.h"
+#include "phase_capture.h"
+
 extern "C" void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -39,27 +41,54 @@ extern "C" void SystemClock_Config(void)
         Error_Handler();
     }
 }
+
 #define HEARTBEAT_LED PA_6
 void heartbeat();
-void setup() {
-  pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
-  digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH); // Turn off the LED initially (assuming active low)
 
-  // DAC control output: PA4, mid-scale (about 1.65 V) on start.
+void setup() {
+  Serial.begin(115200);
+  pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
+  digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
+
+  // DAC control output: PA4, mid-scale (1.65 V) on start.
   dac::begin();
-  dac::setVoltage(0);
+  dac::setVoltage(1.65f);
+
+  // Initialize 32-bit Input Capture on TIM2:
+  // PA0 = Reference input (Rising edge trigger)
+  // PA1 = ZCD feedback input (Rising edge trigger)
+  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
 }
 
 void loop() {
   heartbeat();
+
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint >= 500) {
+    lastPrint = millis();
+
+    phase_capture::CaptureData data = phase_capture::getData();
+    if (data.valid) {
+      Serial.printf("LOCK | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us\n",
+                    data.frequencyHz,
+                    data.phaseDiffDeg,
+                    phase_capture::ticksToUs(data.periodTicks));
+    } else if (data.refValid && !data.zcdPresent) {
+      Serial.printf("WAIT ZCD | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing\n",
+                    data.frequencyHz);
+    } else {
+      Serial.println("NO REF SIGNAL | Waiting for generator input on PA0...");
+    }
+  }
 }
+
 
 void heartbeat() {
   static uint32_t lastToggleTime = 0;
   uint32_t currentTime = millis();
 
-  if (currentTime - lastToggleTime >= 500) { // Toggle every 500 ms
+  if (currentTime - lastToggleTime >= 500) {
     lastToggleTime = currentTime;
-    digitalToggleFast(digitalPinToPinName(HEARTBEAT_LED)); // Use digitalToggleFast for faster toggling
+    digitalToggleFast(digitalPinToPinName(HEARTBEAT_LED));
   }
 }
