@@ -1,0 +1,7 @@
+{
+    // Re-enable the C/C++ IntelliSense engine for this PlatformIO project.
+    // The global user setting sets it to "disabled" (set by the STM32CubeIDE
+    // clangd extension), which breaks autocomplete, hover, and
+    // Ctrl+Click -> Go to Definition here.
+    "C_Cpp.intelliSenseEngine": "default"
+}
