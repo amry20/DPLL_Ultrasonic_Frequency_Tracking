@@ -44,6 +44,7 @@ extern "C" void SystemClock_Config(void)
 
 #define HEARTBEAT_LED PA_6
 void heartbeat();
+void processSerialCommand();
 
 void setup() {
   Serial.begin(115200);
@@ -58,10 +59,14 @@ void setup() {
   // PA0 = Reference input (Rising edge trigger)
   // PA1 = ZCD feedback input (Rising edge trigger)
   phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
+
+  Serial.println(F("DPLL Ultrasonic Frequency Tracking"));
+  Serial.println(F("Commands: \"dac <volt>\" to set DAC voltage (0.0 - 3.3), e.g. \"dac 1.2\""));
 }
 
 void loop() {
   heartbeat();
+  processSerialCommand();
 
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 500) {
@@ -69,15 +74,45 @@ void loop() {
 
     phase_capture::CaptureData data = phase_capture::getData();
     if (data.valid) {
-      Serial.printf("LOCK | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us\n",
+      Serial.printf("LOCK | Freq: %.2f Hz | Phase: %.2f deg | Period: %.2f us | DAC: %.2f V\n",
                     data.frequencyHz,
                     data.phaseDiffDeg,
-                    phase_capture::ticksToUs(data.periodTicks));
+                    phase_capture::ticksToUs(data.periodTicks),
+                    dac::lastRaw() * (3.3f / 4095.0f));
     } else if (data.refValid && !data.zcdPresent) {
-      Serial.printf("WAIT ZCD | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing\n",
-                    data.frequencyHz);
+      Serial.printf("WAIT ZCD | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing | DAC: %.2f V\n",
+                    data.frequencyHz,
+                    dac::lastRaw() * (3.3f / 4095.0f));
     } else {
-      Serial.println("NO REF SIGNAL | Waiting for generator input on PA0...");
+      Serial.printf("NO REF SIGNAL | Waiting for generator input on PA0... | DAC: %.2f V\n",
+                    dac::lastRaw() * (3.3f / 4095.0f));
+    }
+  }
+}
+
+// UART command parser: "dac <voltage>" sets DAC output voltage (0.0 - 3.3 V)
+void processSerialCommand() {
+  static String cmd = "";
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      cmd.trim();
+      if (cmd.length() > 0) {
+        if (cmd.startsWith("dac")) {
+          float volt = cmd.substring(4).toFloat();
+          if (volt >= 0.0f && volt <= 3.3f) {
+            dac::setVoltage(volt);
+            Serial.printf("DAC set to %.2f V (raw %u)\n", volt, dac::lastRaw());
+          } else {
+            Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
+          }
+        } else {
+          Serial.println("ERR: Unknown command. Usage: \"dac <volt>\"");
+        }
+      }
+      cmd = "";
+    } else if (c != '\r') {
+      cmd += c;
     }
   }
 }
