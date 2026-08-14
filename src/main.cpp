@@ -47,6 +47,8 @@ void heartbeat();
 void processSerialCommand();
 
 void setup() {
+  Serial.setTx(PA9);
+  Serial.setRx(PA10);
   Serial.begin(115200);
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
