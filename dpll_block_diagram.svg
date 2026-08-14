@@ -1,0 +1,192 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" width="100%" height="100%">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+
+    <linearGradient id="mcuGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <linearGradient id="hwGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1c1917"/>
+      <stop offset="100%" stop-color="#0c0a09"/>
+    </linearGradient>
+
+    <linearGradient id="blockBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+
+    <linearGradient id="blockTeal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d9488"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+
+    <linearGradient id="blockPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+
+    <linearGradient id="blockAmber" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+
+    <linearGradient id="blockRose" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#be123c"/>
+    </linearGradient>
+
+    <!-- Filters -->
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+
+    <!-- Markers -->
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#4ade80"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="640" fill="url(#bgGrad)"/>
+
+  <!-- Title -->
+  <text x="500" y="38" text-anchor="middle" fill="#f8fafc" font-family="Segoe UI, sans-serif" font-size="22" font-weight="700" letter-spacing="1">
+    DPLL ULTRASONIC FREQUENCY TRACKING — SYSTEM ARCHITECTURE
+  </text>
+
+  <!-- Container: STM32F407 MCU -->
+  <rect x="30" y="65" width="600" height="545" rx="16" fill="url(#mcuGrad)" stroke="#3b82f6" stroke-width="2" stroke-dasharray="none" filter="url(#shadow)"/>
+  <rect x="45" y="77" width="220" height="28" rx="6" fill="#1e3a8a"/>
+  <text x="55" y="96" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700" letter-spacing="0.5">
+    MICROCONTROLLER (STM32F407)
+  </text>
+
+  <!-- Container: Hardware Plant -->
+  <rect x="660" y="65" width="310" height="545" rx="16" fill="url(#hwGrad)" stroke="#f59e0b" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="675" y="77" width="230" height="28" rx="6" fill="#451a03"/>
+  <text x="685" y="96" fill="#fde68a" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700" letter-spacing="0.5">
+    ANALOG / HARDWARE PLANT
+  </text>
+
+  <!-- ==================== MCU INTERNAL BLOCKS ==================== -->
+
+  <!-- Target Phase Input -->
+  <rect x="55" y="140" width="105" height="50" rx="10" fill="url(#blockTeal)" filter="url(#shadow)"/>
+  <text x="107" y="162" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="12" font-weight="700">Target Phase</text>
+  <text x="107" y="178" text-anchor="middle" fill="#ccfbf1" font-family="Segoe UI, sans-serif" font-size="11">0.0 ns</text>
+
+  <!-- Summing Node -->
+  <circle cx="210" cy="165" r="18" fill="#1e293b" stroke="#38bdf8" stroke-width="2.5" filter="url(#shadow)"/>
+  <text x="210" y="171" text-anchor="middle" fill="#38bdf8" font-family="Segoe UI, sans-serif" font-size="18" font-weight="bold">∑</text>
+  <text x="182" y="158" fill="#4ade80" font-family="Segoe UI, sans-serif" font-size="13" font-weight="bold">+</text>
+  <text x="207" y="200" fill="#f87171" font-family="Segoe UI, sans-serif" font-size="14" font-weight="bold">−</text>
+
+  <!-- PID Controller -->
+  <rect x="260" y="132" width="145" height="66" rx="10" fill="url(#blockBlue)" filter="url(#shadow)"/>
+  <text x="332" y="154" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">dpll_controller</text>
+  <text x="332" y="172" text-anchor="middle" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="11">PID (Kp, Ki, Kd=0)</text>
+  <text x="332" y="187" text-anchor="middle" fill="#bfdbfe" font-family="Segoe UI, sans-serif" font-size="10">dt = 20 ms</text>
+
+  <!-- Anti-Windup & Clamp -->
+  <rect x="440" y="132" width="165" height="66" rx="10" fill="url(#blockPurple)" filter="url(#shadow)"/>
+  <text x="522" y="154" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="12" font-weight="700">Anti-Windup &amp; Clamp</text>
+  <text x="522" y="172" text-anchor="middle" fill="#ddd6fe" font-family="Segoe UI, sans-serif" font-size="11">0.0 V  –  3.3 V</text>
+
+  <!-- Slew Rate Limiter -->
+  <rect x="440" y="240" width="165" height="60" rx="10" fill="url(#blockPurple)" filter="url(#shadow)"/>
+  <text x="522" y="263" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="12" font-weight="700">Slew-Rate Limiter</text>
+  <text x="522" y="281" text-anchor="middle" fill="#ddd6fe" font-family="Segoe UI, sans-serif" font-size="11">Max 30 V / s</text>
+
+  <!-- DAC Output -->
+  <rect x="440" y="340" width="165" height="60" rx="10" fill="url(#blockRose)" filter="url(#shadow)"/>
+  <text x="522" y="363" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">dac_output (PA4)</text>
+  <text x="522" y="381" text-anchor="middle" fill="#fecdd3" font-family="Segoe UI, sans-serif" font-size="11">12-bit DAC1 (0–4095)</text>
+
+  <!-- Input Capture: TIM2 -->
+  <rect x="250" y="470" width="180" height="66" rx="10" fill="url(#blockTeal)" filter="url(#shadow)"/>
+  <text x="340" y="493" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">TIM2 Input Capture</text>
+  <text x="340" y="511" text-anchor="middle" fill="#ccfbf1" font-family="Segoe UI, sans-serif" font-size="11">32-bit Timer @ 84 MHz</text>
+  <text x="340" y="525" text-anchor="middle" fill="#99f6e4" font-family="Segoe UI, sans-serif" font-size="10">Tick Resolution: ~11.9 ns</text>
+
+  <!-- Phase Calculation -->
+  <rect x="55" y="470" width="150" height="66" rx="10" fill="url(#blockTeal)" filter="url(#shadow)"/>
+  <text x="130" y="493" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="12" font-weight="700">phase_capture</text>
+  <text x="130" y="511" text-anchor="middle" fill="#ccfbf1" font-family="Segoe UI, sans-serif" font-size="11">Diff &amp; ns Conversion</text>
+  <text x="130" y="525" text-anchor="middle" fill="#99f6e4" font-family="Segoe UI, sans-serif" font-size="10">Wrap [-T/2 .. +T/2]</text>
+
+  <!-- ==================== HARDWARE PLANT BLOCKS ==================== -->
+
+  <!-- CD4046 VCO -->
+  <rect x="690" y="340" width="250" height="60" rx="10" fill="url(#blockAmber)" filter="url(#shadow)"/>
+  <text x="815" y="363" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="14" font-weight="700">CD4046 VCO</text>
+  <text x="815" y="381" text-anchor="middle" fill="#fef3c7" font-family="Segoe UI, sans-serif" font-size="11">Voltage-Controlled Oscillator</text>
+
+  <!-- Driver & Transducer -->
+  <rect x="690" y="220" width="250" height="60" rx="10" fill="url(#blockAmber)" filter="url(#shadow)"/>
+  <text x="815" y="243" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">Gate Driver &amp; Load</text>
+  <text x="815" y="261" text-anchor="middle" fill="#fef3c7" font-family="Segoe UI, sans-serif" font-size="11">Ultrasonic Transducer (High Q)</text>
+
+  <!-- ZCD Circuit -->
+  <rect x="690" y="470" width="250" height="66" rx="10" fill="url(#blockAmber)" filter="url(#shadow)"/>
+  <text x="815" y="493" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">Zero-Crossing Detector</text>
+  <text x="815" y="511" text-anchor="middle" fill="#fef3c7" font-family="Segoe UI, sans-serif" font-size="11">Current Phase Feedback (ZCD)</text>
+
+  <!-- ==================== CONNECTIONS & ARROWS ==================== -->
+
+  <!-- Target -> Summing -->
+  <path d="M 160 165 L 192 165" fill="none" stroke="#4ade80" stroke-width="2.5" marker-end="url(#arrowGreen)"/>
+
+  <!-- Summing -> PID -->
+  <path d="M 228 165 L 260 165" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="244" y="157" text-anchor="middle" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="10">error (ns)</text>
+
+  <!-- PID -> AntiWindup -->
+  <path d="M 405 165 L 440 165" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- AntiWindup -> Slew Limiter -->
+  <path d="M 522 198 L 522 240" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Slew Limiter -> DAC -->
+  <path d="M 522 300 L 522 340" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="532" y="323" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="10">V_ctrl</text>
+
+  <!-- DAC -> CD4046 VCO (Across MCU -> HW Boundary) -->
+  <path d="M 605 370 L 690 370" fill="none" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#arrowAmber)"/>
+  <text x="647" y="360" text-anchor="middle" fill="#fde68a" font-family="Segoe UI, sans-serif" font-size="10" font-weight="700">0–3.3V DAC</text>
+
+  <!-- VCO -> Gate Driver -->
+  <path d="M 815 340 L 815 280" fill="none" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#arrowAmber)"/>
+  <text x="825" y="313" fill="#fde68a" font-family="Segoe UI, sans-serif" font-size="10">VCO Out</text>
+
+  <!-- Gate Driver -> ZCD Circuit -->
+  <path d="M 940 250 L 960 250 L 960 503 L 940 503" fill="none" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#arrowAmber)"/>
+  <text x="965" y="380" fill="#fde68a" font-family="Segoe UI, sans-serif" font-size="10" writing-mode="tb">Load Current</text>
+
+  <!-- VCO Out -> PA0 REF Input (HW -> MCU) -->
+  <path d="M 690 385 L 640 385 L 640 490 L 430 490" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="630" y="440" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="11" font-weight="700">REF (PA0)</text>
+
+  <!-- ZCD Out -> PA1 ZCD Input (HW -> MCU) -->
+  <path d="M 690 515 L 430 515" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="630" y="530" fill="#93c5fd" font-family="Segoe UI, sans-serif" font-size="11" font-weight="700">ZCD (PA1)</text>
+
+  <!-- TIM2 -> Phase Capture -->
+  <path d="M 250 503 L 205 503" fill="none" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Phase Capture -> Summing Node (-) -->
+  <path d="M 130 470 L 130 215 L 210 215 L 210 183" fill="none" stroke="#f87171" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="138" y="330" fill="#fca5a5" font-family="Segoe UI, sans-serif" font-size="11" font-weight="700">Phase Error (ns)</text>
+
+</svg>

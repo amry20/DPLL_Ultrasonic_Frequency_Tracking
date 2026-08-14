@@ -13,9 +13,13 @@ namespace {
 
 float s_kp = 0.0f;
 float s_ki = 0.0f;
+float s_kd = 0.0f;
 
 float s_centerVoltage = 1.65f;
 float s_targetPhaseNs = 0.0f;
+
+float s_lastError = 0.0f;
+bool  s_haveLastError = false;
 
 float s_minVoltage = 0.0f;
 float s_maxVoltage = 3.3f;
@@ -33,8 +37,10 @@ void begin(float centerVoltage, float kp, float ki)
   s_centerVoltage = centerVoltage;
   s_kp = kp;
   s_ki = ki;
+  s_kd = 0.0f;
   s_integral = 0.0f;
   s_outputVoltage = centerVoltage;
+  s_haveLastError = false;
   s_enabled = true;
   dac::setVoltage(s_outputVoltage);
 }
@@ -48,6 +54,11 @@ void setGains(float kp, float ki)
 {
   s_kp = kp;
   s_ki = ki;
+}
+
+void setKd(float kd)
+{
+  s_kd = kd;
 }
 
 void setOutputLimits(float minV, float maxV)
@@ -78,6 +89,7 @@ void reset()
 {
   s_integral = 0.0f;
   s_outputVoltage = s_centerVoltage;
+  s_haveLastError = false;
   dac::setVoltage(s_outputVoltage);
 }
 
@@ -105,8 +117,17 @@ float update(float phaseErrorNs, float dtSeconds)
   // Integral term (with anti-windup via output clamping below)
   s_integral += s_ki * error * dtSeconds;
 
+  // Derivative term (disabled by default: Kd = 0).
+  // NOTE: derivative amplifies noise; enable only with a small Kd.
+  float derivative = 0.0f;
+  if (s_haveLastError) {
+    derivative = s_kd * (error - s_lastError) / dtSeconds;
+  }
+  s_lastError = error;
+  s_haveLastError = true;
+
   // Unclamped control voltage
-  float voltage = s_centerVoltage + proportional + s_integral;
+  float voltage = s_centerVoltage + proportional + s_integral + derivative;
 
   // Clamp output
   if (voltage > s_maxVoltage) {
@@ -160,6 +181,7 @@ void manualSet(float voltage)
 
 float getKp()            { return s_kp; }
 float getKi()            { return s_ki; }
+float getKd()            { return s_kd; }
 float getCenterVoltage() { return s_centerVoltage; }
 float getTargetPhase()   { return s_targetPhaseNs; }
 float getMaxSlew()       { return s_maxSlew; }

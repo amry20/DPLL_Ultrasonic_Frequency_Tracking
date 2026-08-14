@@ -7,11 +7,16 @@
  * difference between the reference signal and the ZCD feedback converges to a
  * target value (usually 0 degrees = resonance).
  *
- * The controller is a standard PI loop:
+ * The controller is a PID loop:
  *
  *   error        = targetDelay - measuredDelay   (nanoseconds)
  *   integral    += error * dt
- *   voltage      = centerVoltage + (Kp * error + Ki * integral)
+ *   derivative   = d(error)/dt
+ *   voltage      = centerVoltage + (Kp*error + Ki*integral + Kd*derivative)
+ *
+ * Kd (derivative) defaults to 0, reducing the loop to PI, which is the
+ * recommended configuration for a noisy phase signal. Enable it only with a
+ * small value if faster transient damping is needed.
  *
  * The output is clamped to [minVoltage, maxVoltage] with anti-windup on the
  * integrator. All timing is derived from the caller-supplied dt so the loop
@@ -35,6 +40,9 @@ void setTargetPhase(float targetNs);
 
 // Update the PI gains at runtime.
 void setGains(float kp, float ki);
+
+// Set the derivative gain (V per ns/s). Default 0 (derivative disabled).
+void setKd(float kd);
 
 // Clamp the DAC output to [minV, maxV] volts (default 0.0 .. 3.3).
 void setOutputLimits(float minV, float maxV);
@@ -68,6 +76,7 @@ void manualSet(float voltage);
 // Current configuration getters (for UART status/tuning).
 float getKp();
 float getKi();
+float getKd();
 float getCenterVoltage();
 float getTargetPhase();
 float getMaxSlew();

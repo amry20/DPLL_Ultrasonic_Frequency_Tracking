@@ -2,6 +2,7 @@
 #include "dac_output.h"
 #include "phase_capture.h"
 #include "dpll_controller.h"
+#include "com.h"
 
 extern "C" void SystemClock_Config(void)
 {
@@ -59,9 +60,7 @@ constexpr float kLockThresholdNs = 500.0f;
 static bool g_manualMode = false;
 
 void setup() {
-  Serial.setTx(PA9);
-  Serial.setRx(PA10);
-  Serial.begin(115200);
+  com::begin();
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
 
@@ -163,6 +162,7 @@ void handleCommand(const String& cmd) {
     Serial.println(F("  dac <volt>    : manual DAC voltage (0.0-3.3), disables loop"));
     Serial.println(F("  kp <val>      : set proportional gain (V/ns)"));
     Serial.println(F("  ki <val>      : set integral gain (V/ns/s)"));
+    Serial.println(F("  kd <val>      : set derivative gain (V/ns/s)"));
     Serial.println(F("  center <volt> : set center voltage"));
     Serial.println(F("  target <ns>   : set lock delay (ns)"));
     Serial.println(F("  slew <V/s>    : set max DAC slew rate (V/s)"));
@@ -195,6 +195,11 @@ void handleCommand(const String& cmd) {
     dpll::setGains(dpll::getKp(), v);
     Serial.printf("Ki = %.5f V/ns/s\n", v);
   }
+  else if (name == "kd") {
+    float v = arg.toFloat();
+    dpll::setKd(v);
+    Serial.printf("Kd = %.5f V/ns/s\n", v);
+  }
   else if (name == "center") {
     float v = arg.toFloat();
     if (v >= 0.0f && v <= 3.3f) {
@@ -210,8 +215,8 @@ void handleCommand(const String& cmd) {
     Serial.printf("Target phase = %.1f ns\n", v);
   }
   else if (name == "gain") {
-    Serial.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s\n",
-                  dpll::getKp(), dpll::getKi(), dpll::getCenterVoltage(),
+    Serial.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s\n",
+                  dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
                   dpll::getTargetPhase(), dpll::getMaxSlew(), g_manualMode ? "yes" : "no");
   }
   else if (name == "slew") {
