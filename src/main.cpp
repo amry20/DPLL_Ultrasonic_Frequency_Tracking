@@ -3,7 +3,7 @@
 #include "phase_capture.h"
 #include "dpll_controller.h"
 #include "com.h"
-
+#include <HardwareSerial.h>
 extern "C" void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -49,20 +49,15 @@ void heartbeat();
 void processSerialDebugCommand();
 void processDPLL();
 void debugPrint();
+void sendMonitorStream();
 void commandProccessor();
-// DPLL control loop period in milliseconds (runtime-configurable via "loop <ms>").
-// Must be long enough for the high-Q transducer to settle after each DAC step:
-// settling time tau ~ Q / (2*pi*f0); choose period >= ~5 * tau.
-// Default 20 ms is a safe starting point for typical ultrasonic transducers.
-static uint32_t g_loopPeriodMs = 20;
-// Phase error (absolute nanoseconds) below which the loop is considered "LOCK".
-constexpr float kLockThresholdNs = 500.0f;
-
-// Manual mode: when true, the DPLL loop is disengaged and the DAC is set by hand.
-static bool g_manualMode = false;
-
+void setupSerialDebug();
+// All loop-config state lives in dpll_controller (accessible via dpll:: getters/setters).
+// Default values are set there; use opcode or UART command to change at runtime.
+HardwareSerial DebugPort(PA10, PA9); // RX, TX
 void setup()
 {
+  setupSerialDebug();
   com::begin();
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
@@ -97,8 +92,16 @@ void loop()
   com::receive_command();
   commandProccessor();
   processSerialDebugCommand();
+  sendMonitorStream();
   debugPrint();
   heartbeat();
+}
+
+void setupSerialDebug()
+{
+  DebugPort.begin(115200);
+  DebugPort.println(F("DPLL Ultrasonic Frequency Tracking"));
+  DebugPort.println(F("Type 'help' for commands."));
 }
 void commandProccessor()
 {
@@ -125,12 +128,12 @@ void debugPrint()
     lastPrint = millis();
 
     phase_capture::CaptureData data = phase_capture::getData();
-    const char *manual = g_manualMode ? " [MANUAL]" : "";
+    const char *manual = dpll::getManualMode() ? " [MANUAL]" : "";
     if (data.valid)
     {
       float absPhase = data.phaseDiffNs < 0.0f ? -data.phaseDiffNs : data.phaseDiffNs;
-      const char *state = (absPhase <= kLockThresholdNs) ? "LOCK" : "TRACK";
-      Serial.printf("%s%s | Freq: %.2f Hz | Phase: %.1f ns | Period: %.2f us | DAC: %.2f V\n",
+      const char *state = (absPhase <= dpll::getLockThresholdNs()) ? "LOCK" : "TRACK";
+      DebugPort.printf("%s%s | Freq: %.2f Hz | Phase: %.1f ns | Period: %.2f us | DAC: %.2f V\n",
                     state, manual,
                     data.frequencyHz,
                     data.phaseDiffNs,
@@ -139,60 +142,127 @@ void debugPrint()
     }
     else if (data.refValid && !data.zcdPresent)
     {
-      Serial.printf("WAIT ZCD%s | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing | DAC: %.2f V\n",
+      DebugPort.printf("WAIT ZCD%s | REF Freq: %.2f Hz | Power Enable OFF / ZCD missing | DAC: %.2f V\n",
                     manual,
                     data.frequencyHz,
                     dac::lastRaw() * (3.3f / 4095.0f));
     }
     else
     {
-      Serial.printf("NO REF SIGNAL%s | Waiting for generator input on PA0... | DAC: %.2f V\n",
+      DebugPort.printf("NO REF SIGNAL%s | Waiting for generator input on PA0... | DAC: %.2f V\n",
                     manual,
                     dac::lastRaw() * (3.3f / 4095.0f));
     }
   }
 }
+// Fixed-rate monitor stream — runs independently of the settling window.
+// Rate is set by dpll::getStreamPeriodMs() (default 100 ms = 10 Hz).
+// Sends a packet for ALL states: LOCK, TRACK, WAIT_ZCD, NO_REF.
+void sendMonitorStream()
+{
+  if (!com::GetAllowSendStream()) return;
+
+  static uint32_t lastStream = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastStream < dpll::getStreamPeriodMs()) return;
+  lastStream = nowMs;
+
+  phase_capture::CaptureData data = phase_capture::getData();
+  float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
+  const float kLockThr = dpll::getLockThresholdNs();
+  bool isLocked = data.valid &&
+                  (data.phaseDiffNs >= -kLockThr) &&
+                  (data.phaseDiffNs <=  kLockThr);
+
+  dpllStatusData status;
+  status.ReferenceFrequencyHz = data.frequencyHz;
+  // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK
+  if (!data.refValid)                 status.LockStatus = 0;
+  else if (!data.zcdPresent)          status.LockStatus = 1;
+  else if (!isLocked)                 status.LockStatus = 2;
+  else                                status.LockStatus = 3;
+  status.PhaseError_ns = data.phaseDiffNs;
+  status.DACVoltage_V  = currentDacV;
+  com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
+}
 void processDPLL()
 {
-  // --- DPLL control loop (fixed rate, non-blocking) ---
-  static uint32_t lastControl = 0;
+  // --- DPLL control loop ---
+  // Sequence per cycle:
+  //   1. DAC was updated at lastDacUpdate.
+  //   2. Wait g_loopPeriodMs ms for transducer to settle.
+  //   3. Read phase (getData) AFTER settling is complete.
+  //   4. Update DAC -> record lastDacUpdate, start next settling window.
+  static uint32_t lastDacUpdate = 0;
   static bool wasValid = false;
+  static bool firstRun = true;
+  static uint32_t lockHoldCount = 0;  // consecutive LOCK cycles counter
+
   uint32_t nowMs = millis();
-  if (nowMs - lastControl >= g_loopPeriodMs)
-  {
-    lastControl = nowMs;
-    phase_capture::CaptureData data = phase_capture::getData();
-    // send DPLL status stream if enabled
-    if (com::GetAllowSendStream())
-    {
-      dpllStatusData status;
-      status.ReferenceFrequencyHz = data.frequencyHz;
-      status.LockStatus = (data.valid && (data.phaseDiffNs < kLockThresholdNs)) ? 1 : 0;
-      status.PhaseError_ns = data.phaseDiffNs;
-      status.DACVoltage_V = dac::lastRaw() * (3.3f / 4095.0f);
-      com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
-    }
-    if (g_manualMode)
-    {
-      // Manual control: keep DAC as the user set it; do not run the loop.
-    }
-    else if (data.valid)
-    {
-      if (!wasValid)
-      {
-        // Re-acquire: restart from center voltage for a clean lock.
-        dpll::reset();
-      }
-      dpll::enable(true);
-      dpll::update(data.phaseDiffNs, g_loopPeriodMs * 0.001f);
-    }
-    else
-    {
-      // Power off / signal missing -> drive DAC to 0 V.
-      dpll::shutdown();
-    }
-    wasValid = data.valid;
+
+  // On first run, start the settling timer immediately without updating DAC.
+  if (firstRun) {
+    lastDacUpdate = nowMs;
+    firstRun = false;
+    return;
   }
+
+  // Wait until settling window expires before reading phase.
+  if (nowMs - lastDacUpdate < dpll::getLoopPeriodMs()) {
+    return;
+  }
+
+  // Settling done — read phase NOW (transducer has settled after last DAC step).
+  phase_capture::CaptureData data = phase_capture::getData();
+
+  // --- Lock-point memory ---
+  // Track consecutive LOCK cycles. Once stable for kLockHoldCycles,
+  // save current DAC voltage as the new center for next re-acquire.
+  float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
+  const float kLockThr = dpll::getLockThresholdNs();
+  bool isLocked = data.valid &&
+                  (data.phaseDiffNs >= -kLockThr) &&
+                  (data.phaseDiffNs <=  kLockThr);
+  if (isLocked) {
+    lockHoldCount++;
+    if (lockHoldCount >= dpll::getLockHoldCycles()) {
+      // Lock confirmed stable — update center voltage memory.
+      if (!dpll::haveLockedCenter() || (currentDacV != dpll::getLockedCenterV())) {
+        dpll::setLockedCenter(currentDacV);
+        DebugPort.printf("[LOCK SAVED] center = %.3f V\n", currentDacV);
+      }
+    }
+  } else {
+    lockHoldCount = 0;
+  }
+
+  // Update DAC — record timestamp immediately after update to start next settling window.
+  if (dpll::getManualMode())
+  {
+    // Manual: keep DAC as user set it; do not run the loop.
+  }
+  else if (data.valid)
+  {
+    if (!wasValid)
+    {
+      // Re-acquire: restart from saved lock center (or default 1.65V on first run).
+      float center = dpll::getLockedCenterV();
+      dpll::begin(center, dpll::getKp(), dpll::getKi());
+      dpll::reset();
+      DebugPort.printf("[RE-ACQUIRE] start center = %.3f V\n", center);
+    }
+    dpll::enable(true);
+    dpll::update(data.phaseDiffNs, dpll::getLoopPeriodMs() * 0.001f);
+  }
+  else
+  {
+    // Signal missing -> drive DAC to 0 V.
+    dpll::shutdown();
+  }
+
+  // Record the exact moment DAC was updated — settling window starts NOW.
+  lastDacUpdate = millis();
+  wasValid = data.valid;
 }
 // Parse and execute one full command line (already trimmed).
 void handleDebugCommand(const String &cmd)
@@ -205,55 +275,55 @@ void handleDebugCommand(const String &cmd)
 
   if (name == "help" || name == "?")
   {
-    Serial.println(F("Commands:"));
-    Serial.println(F("  dac <volt>    : manual DAC voltage (0.0-3.3), disables loop"));
-    Serial.println(F("  kp <val>      : set proportional gain (V/ns)"));
-    Serial.println(F("  ki <val>      : set integral gain (V/ns/s)"));
-    Serial.println(F("  kd <val>      : set derivative gain (V/ns/s)"));
-    Serial.println(F("  center <volt> : set center voltage"));
-    Serial.println(F("  target <ns>   : set lock delay (ns)"));
-    Serial.println(F("  slew <V/s>    : set max DAC slew rate (V/s)"));
-    Serial.println(F("  loop <ms>     : set control loop period (ms)"));
-    Serial.println(F("  gain          : show current gains"));
-    Serial.println(F("  reset         : clear integrator, restart from center"));
-    Serial.println(F("  run           : re-enable control loop"));
+    DebugPort.println(F("Commands:"));
+    DebugPort.println(F("  dac <volt>    : manual DAC voltage (0.0-3.3), disables loop"));
+    DebugPort.println(F("  kp <val>      : set proportional gain (V/ns)"));
+    DebugPort.println(F("  ki <val>      : set integral gain (V/ns/s)"));
+    DebugPort.println(F("  kd <val>      : set derivative gain (V/ns/s)"));
+    DebugPort.println(F("  center <volt> : set center voltage"));
+    DebugPort.println(F("  target <ns>   : set lock delay (ns)"));
+    DebugPort.println(F("  slew <V/s>    : set max DAC slew rate (V/s)"));
+    DebugPort.println(F("  loop <ms>     : set control loop period (ms)"));
+    DebugPort.println(F("  gain          : show current gains"));
+    DebugPort.println(F("  reset         : clear integrator, restart from center"));
+    DebugPort.println(F("  run           : re-enable control loop"));
   }
   else if (name == "dac")
   {
     if (arg.length() == 0)
     {
-      Serial.printf("DAC now: %.3f V\n", dac::lastRaw() * (3.3f / 4095.0f));
+      DebugPort.printf("DAC now: %.3f V\n", dac::lastRaw() * (3.3f / 4095.0f));
       return;
     }
     float v = arg.toFloat();
     if (v >= 0.0f && v <= 3.3f)
     {
-      g_manualMode = true;
+      dpll::setManualMode(true);
       dpll::manualSet(v);
-      Serial.printf("DAC set to %.2f V (raw %u) - loop disabled\n", v, dac::lastRaw());
+      DebugPort.printf("DAC set to %.2f V (raw %u) - loop disabled\n", v, dac::lastRaw());
     }
     else
     {
-      Serial.println("ERR: Voltage out of range (0.0 - 3.3 V)");
+      DebugPort.println("ERR: Voltage out of range (0.0 - 3.3 V)");
     }
   }
   else if (name == "kp")
   {
     float v = arg.toFloat();
     dpll::setGains(v, dpll::getKi());
-    Serial.printf("Kp = %.5f V/ns\n", v);
+    DebugPort.printf("Kp = %.5f V/ns\n", v);
   }
   else if (name == "ki")
   {
     float v = arg.toFloat();
     dpll::setGains(dpll::getKp(), v);
-    Serial.printf("Ki = %.5f V/ns/s\n", v);
+    DebugPort.printf("Ki = %.5f V/ns/s\n", v);
   }
   else if (name == "kd")
   {
     float v = arg.toFloat();
     dpll::setKd(v);
-    Serial.printf("Kd = %.5f V/ns/s\n", v);
+    DebugPort.printf("Kd = %.5f V/ns/s\n", v);
   }
   else if (name == "center")
   {
@@ -261,24 +331,25 @@ void handleDebugCommand(const String &cmd)
     if (v >= 0.0f && v <= 3.3f)
     {
       dpll::begin(v, dpll::getKp(), dpll::getKi());
-      Serial.printf("Center = %.2f V\n", v);
+      DebugPort.printf("Center = %.2f V\n", v);
     }
     else
     {
-      Serial.println("ERR: out of range (0.0 - 3.3 V)");
+      DebugPort.println("ERR: out of range (0.0 - 3.3 V)");
     }
   }
   else if (name == "target")
   {
     float v = arg.toFloat();
     dpll::setTargetPhase(v);
-    Serial.printf("Target phase = %.1f ns\n", v);
+    DebugPort.printf("Target phase = %.1f ns\n", v);
   }
   else if (name == "gain")
   {
-    Serial.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s\n",
+    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V\n",
                   dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
-                  dpll::getTargetPhase(), dpll::getMaxSlew(), g_manualMode ? "yes" : "no");
+                  dpll::getTargetPhase(), dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
+                  dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(), dpll::getLockedCenterV());
   }
   else if (name == "slew")
   {
@@ -286,11 +357,11 @@ void handleDebugCommand(const String &cmd)
     if (v > 0.0f)
     {
       dpll::setMaxSlew(v);
-      Serial.printf("Max slew = %.1f V/s\n", v);
+      DebugPort.printf("Max slew = %.1f V/s\n", v);
     }
     else
     {
-      Serial.println("ERR: slew must be > 0 (V/s)");
+      DebugPort.println("ERR: slew must be > 0 (V/s)");
     }
   }
   else if (name == "loop")
@@ -298,30 +369,30 @@ void handleDebugCommand(const String &cmd)
     int v = arg.toInt();
     if (v >= 1 && v <= 1000)
     {
-      g_loopPeriodMs = (uint32_t)v;
-      Serial.printf("Loop period = %u ms\n", g_loopPeriodMs);
+      dpll::setLoopPeriodMs((uint32_t)v);
+      DebugPort.printf("Loop period = %u ms\n", dpll::getLoopPeriodMs());
     }
     else
     {
-      Serial.println("ERR: loop period must be 1-1000 ms");
+      DebugPort.println("ERR: loop period must be 1-1000 ms");
     }
   }
   else if (name == "reset")
   {
-    g_manualMode = false;
+    dpll::setManualMode(false);
     dpll::reset();
     dpll::enable(true);
-    Serial.println("Controller reset to center voltage, loop enabled");
+    DebugPort.println("Controller reset to center voltage, loop enabled");
   }
   else if (name == "run")
   {
-    g_manualMode = false;
+    dpll::setManualMode(false);
     dpll::enable(true);
-    Serial.println("Control loop enabled");
+    DebugPort.println("Control loop enabled");
   }
   else
   {
-    Serial.println("ERR: Unknown command. Type \"help\".");
+    DebugPort.println("ERR: Unknown command. Type \"help\".");
   }
 }
 
@@ -330,12 +401,12 @@ void processSerialDebugCommand()
 {
   static String cmd = "";
 
-  if (!Serial.available())
+  if (!DebugPort.available())
   {
     return; // Nothing to read, return immediately
   }
 
-  char c = (char)Serial.read();
+  char c = (char)DebugPort.read();
   if (c == '\n')
   {
     cmd.trim();

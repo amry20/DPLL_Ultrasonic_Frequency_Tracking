@@ -83,4 +83,33 @@ namespace dpll
     float getTargetPhase();
     float getMaxSlew();
 
+    // --- Loop / acquisition config (all configurable via opcode) ---
+
+    // Control loop period in milliseconds (1–1000). Default 20.
+    uint32_t getLoopPeriodMs();
+    void     setLoopPeriodMs(uint32_t ms);
+
+    // Phase error magnitude (ns) below which the loop is considered locked. Default 500.
+    float    getLockThresholdNs();
+    void     setLockThresholdNs(float ns);
+
+    // Manual mode: when true, DPLL loop is disengaged, DAC held by user.
+    bool     getManualMode();
+    void     setManualMode(bool on);
+
+    // Lock-point memory: DAC voltage saved when lock is stable.
+    float    getLockedCenterV();
+    bool     haveLockedCenter();
+    void     setLockedCenter(float v);   // sets voltage + marks valid
+    void     clearLockedCenter();        // resets to 1.65 V, marks invalid
+
+    // Consecutive LOCK cycles required before committing center voltage. Default 10.
+    uint32_t getLockHoldCycles();
+    void     setLockHoldCycles(uint32_t n);
+
+    // Monitor stream rate in milliseconds (1–65535). Default 100 ms = 10 Hz.
+    // sendMonitorStream() uses this to decouple stream rate from settling window.
+    uint32_t getStreamPeriodMs();
+    void     setStreamPeriodMs(uint32_t ms);
+
 } // namespace dpll

@@ -30,6 +30,15 @@ float s_maxSlew = 30.0f; // V/s
 
 bool s_enabled = true;
 
+// --- Loop / acquisition config (configurable via opcode) ---
+uint32_t s_loopPeriodMs      = 20;
+float    s_lockThresholdNs   = 500.0f;
+bool     s_manualMode        = false;
+float    s_lockedCenterV     = 1.65f;
+bool     s_haveLockedCenter  = false;
+uint32_t s_lockHoldCycles    = 10;
+uint32_t s_streamPeriodMs    = 10;   // monitor stream rate (ms); 10 ms = 100 Hz fixed
+
 } // namespace
 
 void begin(float centerVoltage, float kp, float ki, float kd)
@@ -185,5 +194,26 @@ float getKd()            { return s_kd; }
 float getCenterVoltage() { return s_centerVoltage; }
 float getTargetPhase()   { return s_targetPhaseNs; }
 float getMaxSlew()       { return s_maxSlew; }
+
+// --- Loop / acquisition config ---
+uint32_t getLoopPeriodMs()          { return s_loopPeriodMs; }
+void     setLoopPeriodMs(uint32_t v){ if (v >= 1 && v <= 1000) s_loopPeriodMs = v; }
+
+float    getLockThresholdNs()       { return s_lockThresholdNs; }
+void     setLockThresholdNs(float v){ if (v > 0.0f) s_lockThresholdNs = v; }
+
+bool     getManualMode()            { return s_manualMode; }
+void     setManualMode(bool v)      { s_manualMode = v; }
+
+float    getLockedCenterV()         { return s_lockedCenterV; }
+bool     haveLockedCenter()         { return s_haveLockedCenter; }
+void     setLockedCenter(float v)   { s_lockedCenterV = v; s_haveLockedCenter = true; }
+void     clearLockedCenter()        { s_haveLockedCenter = false; s_lockedCenterV = 1.65f; }
+
+uint32_t getLockHoldCycles()        { return s_lockHoldCycles; }
+void     setLockHoldCycles(uint32_t v){ if (v >= 1) s_lockHoldCycles = v; }
+
+uint32_t getStreamPeriodMs()        { return s_streamPeriodMs; }
+void     setStreamPeriodMs(uint32_t v){ if (v >= 1) s_streamPeriodMs = v; }
 
 } // namespace dpll

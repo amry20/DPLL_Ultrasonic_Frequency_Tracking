@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "com.h"
 #include "CircularBuffer.h"
-
+#include <USBSerial.h>
 namespace com
 {
     namespace
@@ -34,23 +34,21 @@ namespace com
     }
     void begin()
     {
-        Serial.setTx(PA9);
-        Serial.setRx(PA10);
-        Serial.begin(115200);
+        SerialUSB.begin(115200);
         RxOpcodeQueue.clear();
         TxOpcodeQueue.clear();
     }
     void end()
     {
-        Serial.end();
+        SerialUSB.end();
     }
     void receive_command()
     {
-        if (Serial.available() >= COM_HEADER_SIZE)
+        if (SerialUSB.available() >= COM_HEADER_SIZE)
         {
             ComPacket packet;
             // Read the header
-            Serial.readBytes((uint8_t *)&packet.header, COM_HEADER_SIZE);
+            SerialUSB.readBytes((uint8_t *)&packet.header, COM_HEADER_SIZE);
             // Validate header
             if (packet.header.startByte != START_BYTE || packet.header.endByte != END_BYTE)
             {
@@ -62,7 +60,7 @@ namespace com
             {
                 return;
             }
-            Serial.readBytes(packet.payload, payloadLength + 1); // read payload + checksum
+            SerialUSB.readBytes(packet.payload, payloadLength + 1); // read payload + checksum
             // Validate checksum
             uint8_t calculatedChecksum = calculate_sum(packet.payload, payloadLength);
             if (calculatedChecksum != packet.payload[payloadLength])
