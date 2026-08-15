@@ -32,12 +32,12 @@ bool s_enabled = true;
 
 } // namespace
 
-void begin(float centerVoltage, float kp, float ki)
+void begin(float centerVoltage, float kp, float ki, float kd)
 {
   s_centerVoltage = centerVoltage;
   s_kp = kp;
   s_ki = ki;
-  s_kd = 0.0f;
+  s_kd = kd;
   s_integral = 0.0f;
   s_outputVoltage = centerVoltage;
   s_haveLastError = false;

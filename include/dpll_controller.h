@@ -27,58 +27,60 @@
 
 #include <stdint.h>
 
-namespace dpll {
+namespace dpll
+{
 
-// Initialize the controller.
-// centerVoltage : VCO voltage that produces the nominal/center frequency.
-// kp            : proportional gain (V per nanosecond of phase error).
-// ki            : integral gain (V per nanosecond per second).
-void begin(float centerVoltage, float kp, float ki);
+    // Initialize the controller.
+    // centerVoltage : VCO voltage that produces the nominal/center frequency.
+    // kp            : proportional gain (V per nanosecond of phase error).
+    // ki            : integral gain (V per nanosecond per second).
+    // kd            : derivative gain (V per nanosecond per second).
+    void begin(float centerVoltage, float kp, float ki, float kd = 0.0f);
 
-// Set the phase delay the loop should lock onto, in nanoseconds (default 0).
-void setTargetPhase(float targetNs);
+    // Set the phase delay the loop should lock onto, in nanoseconds (default 0).
+    void setTargetPhase(float targetNs);
 
-// Update the PI gains at runtime.
-void setGains(float kp, float ki);
+    // Update the PI gains at runtime.
+    void setGains(float kp, float ki);
 
-// Set the derivative gain (V per ns/s). Default 0 (derivative disabled).
-void setKd(float kd);
+    // Set the derivative gain (V per ns/s). Default 0 (derivative disabled).
+    void setKd(float kd);
 
-// Clamp the DAC output to [minV, maxV] volts (default 0.0 .. 3.3).
-void setOutputLimits(float minV, float maxV);
+    // Clamp the DAC output to [minV, maxV] volts (default 0.0 .. 3.3).
+    void setOutputLimits(float minV, float maxV);
 
-// Limit the maximum DAC change rate (V/s). Prevents violent slamming when
-// gains are misconfigured. Default 30 V/s (0.3 V per 10 ms step).
-void setMaxSlew(float voltsPerSecond);
+    // Limit the maximum DAC change rate (V/s). Prevents violent slamming when
+    // gains are misconfigured. Default 30 V/s (0.3 V per 10 ms step).
+    void setMaxSlew(float voltsPerSecond);
 
-// Enable or disable the control loop. When disabled, output holds last value.
-void enable(bool on);
-bool isEnabled();
+    // Enable or disable the control loop. When disabled, output holds last value.
+    void enable(bool on);
+    bool isEnabled();
 
-// Clear the integrator and return the output to centerVoltage.
-void reset();
+    // Clear the integrator and return the output to centerVoltage.
+    void reset();
 
-// Run one control step.
-// phaseErrorNs : measured phase difference in nanoseconds (from phase_capture).
-// dtSeconds    : time since the previous update call, in seconds.
-// Returns the resulting output voltage in volts (already applied to the DAC).
-float update(float phaseErrorNs, float dtSeconds);
+    // Run one control step.
+    // phaseErrorNs : measured phase difference in nanoseconds (from phase_capture).
+    // dtSeconds    : time since the previous update call, in seconds.
+    // Returns the resulting output voltage in volts (already applied to the DAC).
+    float update(float phaseErrorNs, float dtSeconds);
 
-// Return the last output voltage in volts.
-float lastVoltage();
+    // Return the last output voltage in volts.
+    float lastVoltage();
 
-// Disable the loop and force the DAC to minVoltage (0 V). Use on power-off.
-void shutdown();
+    // Disable the loop and force the DAC to minVoltage (0 V). Use on power-off.
+    void shutdown();
 
-// Disable the loop and force the DAC to a fixed voltage (manual control).
-void manualSet(float voltage);
+    // Disable the loop and force the DAC to a fixed voltage (manual control).
+    void manualSet(float voltage);
 
-// Current configuration getters (for UART status/tuning).
-float getKp();
-float getKi();
-float getKd();
-float getCenterVoltage();
-float getTargetPhase();
-float getMaxSlew();
+    // Current configuration getters (for UART status/tuning).
+    float getKp();
+    float getKi();
+    float getKd();
+    float getCenterVoltage();
+    float getTargetPhase();
+    float getMaxSlew();
 
 } // namespace dpll

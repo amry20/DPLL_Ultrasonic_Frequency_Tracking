@@ -8,7 +8,8 @@ namespace com
     {
         uint8_t rxBuffer[COM_PAYLOAD_MAX_SIZE];
         CircularBuffer<ComPacket, 10> RxOpcodeQueue;
-        CircularBuffer<ComPacket, 15> TxOpcodeQueue;
+        CircularBuffer<ComPacket, 50> TxOpcodeQueue;
+        bool AllowSendStream = false;
 
         uint8_t calculate_sum(uint8_t *bytes, int len)
         {
@@ -45,7 +46,35 @@ namespace com
     }
     void receive_command()
     {
-        
+        if (Serial.available() >= COM_HEADER_SIZE)
+        {
+            ComPacket packet;
+            // Read the header
+            Serial.readBytes((uint8_t *)&packet.header, COM_HEADER_SIZE);
+            // Validate header
+            if (packet.header.startByte != START_BYTE || packet.header.endByte != END_BYTE)
+            {
+                return;
+            }
+            // Read the payload and checksum
+            uint16_t payloadLength = packet.header.payloadLength - 1; // length includes checksum byte
+            if (payloadLength > COM_PAYLOAD_MAX_SIZE)
+            {
+                return;
+            }
+            Serial.readBytes(packet.payload, payloadLength + 1); // read payload + checksum
+            // Validate checksum
+            uint8_t calculatedChecksum = calculate_sum(packet.payload, payloadLength);
+            if (calculatedChecksum != packet.payload[payloadLength])
+            {
+                return;
+            }
+            // Push the packet onto the RX queue
+            if (!RxOpcodeQueue.push(packet))
+            {
+                return;
+            }
+        }
     }
     
     bool sendPacket(uint16_t opcode, uint16_t address, const uint8_t *payload, uint16_t payloadLength)
@@ -57,8 +86,8 @@ namespace com
         packet.header.startByte = START_BYTE; // [0] start byte
         packet.header.opcode = opcode;         // [1..2] opcode (uint16 LE)
         packet.header.address = address;       // [3..4] address (uint16 LE)
-        packet.header.length = payloadLength + 1; // [5..6] length = payloadLength + 1 (the +1 counts the checksum byte).
-        packet.header.EndByte = END_BYTE;     // [7] end byte
+        packet.header.payloadLength = payloadLength + 1; // [5..6] length = payloadLength + 1 (the +1 counts the checksum byte).
+        packet.header.endByte = END_BYTE;     // [7] end byte
 
         //copy payload
         if (payload != nullptr && payloadLength > 0 && payloadLength <= COM_PAYLOAD_MAX_SIZE)
@@ -85,5 +114,26 @@ namespace com
         }
 
         return true;
+    }
+    Opcode getAvailableRxPackets(ComPacket *packets)
+    {
+        if (RxOpcodeQueue.isEmpty())
+        {
+            return ILEGAL_OPCODE; // No packets available
+        }
+        ComPacket packet;
+        if (!RxOpcodeQueue.pop(packet))
+        {
+            return ILEGAL_OPCODE; // Failed to pop packet
+        }
+        return static_cast<Opcode>(packet.header.opcode);
+    }
+    void SetAllowSendStream(bool allow)
+    {
+        AllowSendStream = allow;
+    }
+    bool GetAllowSendStream()
+    {
+        return AllowSendStream;
     }
 }
