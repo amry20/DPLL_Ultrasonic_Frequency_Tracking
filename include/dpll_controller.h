@@ -112,4 +112,13 @@ namespace dpll
     uint32_t getStreamPeriodMs();
     void     setStreamPeriodMs(uint32_t ms);
 
+    // Behaviour when the input signal is lost (REF or ZCD absent).
+    enum SignalLossBehavior : uint8_t {
+        SIGNAL_LOSS_FREEZE = 0,  // Hold DAC at last position (default — best for transient dropouts)
+        SIGNAL_LOSS_CENTER = 1,  // Drive DAC back to centerVoltage, clear integrator
+        SIGNAL_LOSS_ZERO   = 2,  // Drive DAC to 0 V, clear integrator (safe shutdown)
+    };
+    SignalLossBehavior getSignalLossBehavior();
+    void               setSignalLossBehavior(SignalLossBehavior b);
+
 } // namespace dpll

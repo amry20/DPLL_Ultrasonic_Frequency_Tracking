@@ -39,10 +39,11 @@ typedef struct ComPacket
 typedef struct dpllStatusData
 {
     float   ReferenceFrequencyHz;  // 4 bytes — all floats first, naturally aligned
-    float   PhaseError_ns;         // 4 bytes
+    float   PhaseError_ns;         // 4 bytes (last-valid value when PhaseStale=1)
     float   DACVoltage_V;          // 4 bytes
     uint8_t LockStatus;            // 1 byte  (0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK)
-    uint8_t _pad[3];               // 3 bytes explicit pad → total 16 bytes, no hidden gaps
+    uint8_t PhaseStale;            // 1 byte  (0=fresh measurement, 1=ZCD absent, using last valid)
+    uint8_t _pad[2];               // 2 bytes explicit pad → total 16 bytes
 }__attribute__((packed)) dpllStatusData;
 namespace com
 {

@@ -174,6 +174,12 @@ void sendMonitorStream()
                   (data.phaseDiffNs >= -kLockThr) &&
                   (data.phaseDiffNs <=  kLockThr);
 
+  // Hold last valid phase measurement — used when ZCD is absent (DAC frozen, VCO still running).
+  static float s_lastValidPhaseNs = 0.0f;
+  if (data.zcdPresent) {
+    s_lastValidPhaseNs = data.phaseDiffNs;
+  }
+
   dpllStatusData status;
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK
   if (!data.refValid)        status.LockStatus = 0;
@@ -181,9 +187,12 @@ void sendMonitorStream()
   else if (!isLocked)        status.LockStatus = 2;
   else                       status.LockStatus = 3;
   status.ReferenceFrequencyHz = data.frequencyHz;
-  status.PhaseError_ns        = data.phaseDiffNs;
+  // When ZCD absent: send last valid phase (DAC frozen → VCO at same freq → phase estimate still valid).
+  // PhaseStale=1 tells host this is a held value, not a fresh measurement.
+  status.PhaseError_ns        = s_lastValidPhaseNs;
+  status.PhaseStale           = data.zcdPresent ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
-  status._pad[0] = status._pad[1] = status._pad[2] = 0;
+  status._pad[0] = status._pad[1] = 0;
   com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
 }
 void processDPLL()
@@ -246,8 +255,19 @@ void processDPLL()
   {
     if (!wasValid)
     {
-      // Re-acquire: restart from saved lock center, preserve all gains including Kd.
-      float center = dpll::getLockedCenterV();
+      // Re-acquire: choose start center based on signal-loss behaviour.
+      // FREEZE/ZERO : start from locked center (known good operating point).
+      // CENTER      : DAC already at centerVoltage after reset() — start from there
+      //               to avoid a sudden DAC step back to lockedCenterV.
+      float center;
+      if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER)
+      {
+        center = dpll::getCenterVoltage();
+      }
+      else
+      {
+        center = dpll::getLockedCenterV();
+      }
       dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
       DebugPort.printf("[RE-ACQUIRE] start center = %.3f V\n", center);
     }
@@ -256,9 +276,21 @@ void processDPLL()
   }
   else
   {
-    // Signal missing — freeze DAC at last position (do not drive to 0 V).
-    // Lock memory re-acquire will restart cleanly when signal returns.
-    dpll::enable(false);
+    // Signal missing — behaviour set by setSignalLossBehavior().
+    switch (dpll::getSignalLossBehavior())
+    {
+      case dpll::SIGNAL_LOSS_CENTER:
+        dpll::reset();       // DAC → centerVoltage, clear integrator
+        dpll::enable(false);
+        break;
+      case dpll::SIGNAL_LOSS_ZERO:
+        dpll::shutdown();    // DAC → 0 V, clear integrator
+        break;
+      case dpll::SIGNAL_LOSS_FREEZE:
+      default:
+        dpll::enable(false); // DAC frozen at last position
+        break;
+    }
   }
 
   // Record the exact moment DAC was updated — settling window starts NOW.
@@ -288,6 +320,7 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  gain          : show current gains"));
     DebugPort.println(F("  reset         : clear integrator, restart from center"));
     DebugPort.println(F("  run           : re-enable control loop"));
+    DebugPort.println(F("  loss <0|1|2>  : signal-loss DAC behaviour: 0=freeze 1=center 2=zero"));
   }
   else if (name == "dac")
   {
@@ -347,11 +380,12 @@ void handleDebugCommand(const String &cmd)
   }
   else if (name == "gain")
   {
-    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V%s\n",
+    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V%s | loss=%u\n",
                   dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
                   dpll::getTargetPhase(), dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
                   dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(), dpll::getLockedCenterV(),
-                  dpll::haveLockedCenter() ? "" : " (default)");
+                  dpll::haveLockedCenter() ? "" : " (default)",
+                  (uint8_t)dpll::getSignalLossBehavior());
   }
   else if (name == "slew")
   {
@@ -391,6 +425,20 @@ void handleDebugCommand(const String &cmd)
     dpll::setManualMode(false);
     dpll::enable(true);
     DebugPort.println("Control loop enabled");
+  }
+  else if (name == "loss")
+  {
+    int v = arg.toInt();
+    if (v >= 0 && v <= 2)
+    {
+      dpll::setSignalLossBehavior((dpll::SignalLossBehavior)v);
+      const char* names[] = {"freeze", "center", "zero"};
+      DebugPort.printf("Signal-loss behaviour = %s\n", names[v]);
+    }
+    else
+    {
+      DebugPort.println("ERR: loss must be 0=freeze 1=center 2=zero");
+    }
   }
   else
   {

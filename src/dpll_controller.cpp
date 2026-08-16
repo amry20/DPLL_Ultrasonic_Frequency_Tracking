@@ -39,6 +39,8 @@ bool     s_haveLockedCenter  = false;
 uint32_t s_lockHoldCycles    = 10;
 uint32_t s_streamPeriodMs    = 10;   // monitor stream rate (ms); 10 ms = 100 Hz fixed
 
+SignalLossBehavior s_signalLossBehavior = SIGNAL_LOSS_FREEZE;
+
 } // namespace
 
 void begin(float centerVoltage, float kp, float ki, float kd)
@@ -215,5 +217,8 @@ void     setLockHoldCycles(uint32_t v){ if (v >= 1) s_lockHoldCycles = v; }
 
 uint32_t getStreamPeriodMs()        { return s_streamPeriodMs; }
 void     setStreamPeriodMs(uint32_t v){ if (v >= 1) s_streamPeriodMs = v; }
+
+SignalLossBehavior getSignalLossBehavior()                    { return s_signalLossBehavior; }
+void               setSignalLossBehavior(SignalLossBehavior b) { s_signalLossBehavior = b; }
 
 } // namespace dpll
