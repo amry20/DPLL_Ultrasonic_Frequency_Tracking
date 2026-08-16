@@ -134,4 +134,18 @@ namespace com
     {
         return AllowSendStream;
     }
+    void FlushTxQueue()
+    {
+        if (TxOpcodeQueue.isEmpty())
+        {
+            return; // No packets to send
+        }
+        ComPacket packet;
+        TxOpcodeQueue.pop(packet);
+        // Send the packet over SerialUSB
+        uint8_t Buffer[COM_HEADER_SIZE + COM_PAYLOAD_MAX_SIZE];
+        memcpy(Buffer, &packet.header, COM_HEADER_SIZE);
+        memcpy(Buffer + COM_HEADER_SIZE, packet.payload, packet.header.payloadLength);
+        SerialUSB.write(Buffer, COM_HEADER_SIZE + packet.header.payloadLength);
+    }
 }

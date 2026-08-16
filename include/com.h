@@ -57,5 +57,6 @@ namespace com
     Opcode getAvailableRxPackets(ComPacket *packets);
     void SetAllowSendStream(bool allow);
     bool GetAllowSendStream();
+    void FlushTxQueue();
 
 }

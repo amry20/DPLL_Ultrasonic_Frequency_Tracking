@@ -93,6 +93,7 @@ void loop()
   commandProccessor();
   processSerialDebugCommand();
   sendMonitorStream();
+  com::FlushTxQueue(); // flush any pending packets to USB
   debugPrint();
   heartbeat();
 }
@@ -107,7 +108,7 @@ void commandProccessor()
 {
   static ComPacket RxPacket;
   // Drain entire RX queue per loop cycle — prevents stall on burst opcodes.
-  while (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
+  if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
     if (RxPacket.header.opcode == OPCODE_SET_ALLOW_SEND_STREAM)
     {
