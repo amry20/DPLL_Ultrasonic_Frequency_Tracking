@@ -38,10 +38,11 @@ typedef struct ComPacket
 } __attribute__((packed)) ComPacket;
 typedef struct dpllStatusData
 {
-    float ReferenceFrequencyHz;
-    uint8_t LockStatus;
-    float PhaseError_ns;
-    float DACVoltage_V;
+    float   ReferenceFrequencyHz;  // 4 bytes — all floats first, naturally aligned
+    float   PhaseError_ns;         // 4 bytes
+    float   DACVoltage_V;          // 4 bytes
+    uint8_t LockStatus;            // 1 byte  (0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK)
+    uint8_t _pad[3];               // 3 bytes explicit pad → total 16 bytes, no hidden gaps
 }__attribute__((packed)) dpllStatusData;
 namespace com
 {

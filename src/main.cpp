@@ -106,9 +106,9 @@ void setupSerialDebug()
 void commandProccessor()
 {
   static ComPacket RxPacket;
-  if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
+  // Drain entire RX queue per loop cycle — prevents stall on burst opcodes.
+  while (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
-    // Process all available packets in the RX queue
     if (RxPacket.header.opcode == OPCODE_SET_ALLOW_SEND_STREAM)
     {
       if (RxPacket.header.payloadLength >= 1)
@@ -175,14 +175,15 @@ void sendMonitorStream()
                   (data.phaseDiffNs <=  kLockThr);
 
   dpllStatusData status;
-  status.ReferenceFrequencyHz = data.frequencyHz;
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK
-  if (!data.refValid)                 status.LockStatus = 0;
-  else if (!data.zcdPresent)          status.LockStatus = 1;
-  else if (!isLocked)                 status.LockStatus = 2;
-  else                                status.LockStatus = 3;
-  status.PhaseError_ns = data.phaseDiffNs;
-  status.DACVoltage_V  = currentDacV;
+  if (!data.refValid)        status.LockStatus = 0;
+  else if (!data.zcdPresent) status.LockStatus = 1;
+  else if (!isLocked)        status.LockStatus = 2;
+  else                       status.LockStatus = 3;
+  status.ReferenceFrequencyHz = data.frequencyHz;
+  status.PhaseError_ns        = data.phaseDiffNs;
+  status.DACVoltage_V         = currentDacV;
+  status._pad[0] = status._pad[1] = status._pad[2] = 0;
   com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
 }
 void processDPLL()
@@ -245,10 +246,9 @@ void processDPLL()
   {
     if (!wasValid)
     {
-      // Re-acquire: restart from saved lock center (or default 1.65V on first run).
+      // Re-acquire: restart from saved lock center, preserve all gains including Kd.
       float center = dpll::getLockedCenterV();
-      dpll::begin(center, dpll::getKp(), dpll::getKi());
-      dpll::reset();
+      dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
       DebugPort.printf("[RE-ACQUIRE] start center = %.3f V\n", center);
     }
     dpll::enable(true);
@@ -256,8 +256,9 @@ void processDPLL()
   }
   else
   {
-    // Signal missing -> drive DAC to 0 V.
-    dpll::shutdown();
+    // Signal missing — freeze DAC at last position (do not drive to 0 V).
+    // Lock memory re-acquire will restart cleanly when signal returns.
+    dpll::enable(false);
   }
 
   // Record the exact moment DAC was updated — settling window starts NOW.
@@ -330,7 +331,7 @@ void handleDebugCommand(const String &cmd)
     float v = arg.toFloat();
     if (v >= 0.0f && v <= 3.3f)
     {
-      dpll::begin(v, dpll::getKp(), dpll::getKi());
+      dpll::begin(v, dpll::getKp(), dpll::getKi(), dpll::getKd());
       DebugPort.printf("Center = %.2f V\n", v);
     }
     else
@@ -346,10 +347,11 @@ void handleDebugCommand(const String &cmd)
   }
   else if (name == "gain")
   {
-    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V\n",
+    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V%s\n",
                   dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
                   dpll::getTargetPhase(), dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
-                  dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(), dpll::getLockedCenterV());
+                  dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(), dpll::getLockedCenterV(),
+                  dpll::haveLockedCenter() ? "" : " (default)");
   }
   else if (name == "slew")
   {
