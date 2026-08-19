@@ -110,18 +110,214 @@ void commandProccessor()
   // Drain entire RX queue per loop cycle — prevents stall on burst opcodes.
   if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
-    if (RxPacket.header.opcode == OPCODE_GET_VERSION)
+    const uint16_t opcode = RxPacket.header.opcode;
+    const uint8_t *pl = RxPacket.payload;
+    const uint16_t plen = RxPacket.header.payloadLength; // includes checksum byte
+
+    // Payload helpers (little-endian, host sends the same layout).
+    auto payloadFloat = [&]() -> float {
+      float f;
+      memcpy(&f, pl, sizeof(f));
+      return f;
+    };
+    auto payloadU32 = [&]() -> uint32_t {
+      return (uint32_t)pl[0] | ((uint32_t)pl[1] << 8) |
+             ((uint32_t)pl[2] << 16) | ((uint32_t)pl[3] << 24);
+    };
+    auto sendFloat = [&](uint16_t resp, float v) {
+      com::sendPacket(resp, 0, (const uint8_t *)&v, sizeof(v));
+    };
+    auto sendU32 = [&](uint16_t resp, uint32_t v) {
+      com::sendPacket(resp, 0, (const uint8_t *)&v, sizeof(v));
+    };
+    auto sendBool = [&](uint16_t resp, bool v) {
+      uint8_t b = v ? 1 : 0;
+      com::sendPacket(resp, 0, &b, 1);
+    };
+
+    switch (opcode)
     {
-      const char *version = "DPLL v1.0";
-      com::sendPacket(OPCODE_GET_VERSION, 0, (uint8_t *)version, strlen(version));
-    }
-    else if (RxPacket.header.opcode == OPCODE_SET_ALLOW_SEND_STREAM)
-    {
-      if (RxPacket.header.payloadLength >= 1)
+      case OPCODE_GET_VERSION:
       {
-        bool allow = RxPacket.payload[0] != 0;
-        com::SetAllowSendStream(allow);
+        const char *version = "DPLL v1.0";
+        com::sendPacket(OPCODE_GET_VERSION, 0, (uint8_t *)version, strlen(version));
+        break;
       }
+      case OPCODE_SET_ALLOW_SEND_STREAM:
+        if (plen >= 1)
+        {
+          com::SetAllowSendStream(pl[0] != 0);
+        }
+        break;
+      case OPCODE_GET_ALLOW_SEND_STREAM:
+        sendBool(OPCODE_GET_ALLOW_SEND_STREAM, com::GetAllowSendStream());
+        break;
+
+      // --- PID gains (float LE) ---
+      case OPCODE_SET_KP:
+        if (plen >= 5) dpll::setGains(payloadFloat(), dpll::getKi());
+        break;
+      case OPCODE_GET_KP:
+        sendFloat(OPCODE_GET_KP, dpll::getKp());
+        break;
+      case OPCODE_SET_KI:
+        if (plen >= 5) dpll::setGains(dpll::getKp(), payloadFloat());
+        break;
+      case OPCODE_GET_KI:
+        sendFloat(OPCODE_GET_KI, dpll::getKi());
+        break;
+      case OPCODE_SET_KD:
+        if (plen >= 5) dpll::setKd(payloadFloat());
+        break;
+      case OPCODE_GET_KD:
+        sendFloat(OPCODE_GET_KD, dpll::getKd());
+        break;
+
+      // --- Center / target / slew (float LE) ---
+      case OPCODE_SET_CENTER_VOLTAGE:
+        if (plen >= 5)
+        {
+          float v = payloadFloat();
+          if (v >= 0.0f && v <= 3.3f)
+            dpll::begin(v, dpll::getKp(), dpll::getKi(), dpll::getKd());
+        }
+        break;
+      case OPCODE_GET_CENTER_VOLTAGE:
+        sendFloat(OPCODE_GET_CENTER_VOLTAGE, dpll::getCenterVoltage());
+        break;
+      case OPCODE_SET_TARGET_PHASE:
+        if (plen >= 5) dpll::setTargetPhase(payloadFloat());
+        break;
+      case OPCODE_GET_TARGET_PHASE:
+        sendFloat(OPCODE_GET_TARGET_PHASE, dpll::getTargetPhase());
+        break;
+      case OPCODE_SET_MAX_SLEW:
+        if (plen >= 5)
+        {
+          float v = payloadFloat();
+          if (v > 0.0f) dpll::setMaxSlew(v);
+        }
+        break;
+      case OPCODE_GET_MAX_SLEW:
+        sendFloat(OPCODE_GET_MAX_SLEW, dpll::getMaxSlew());
+        break;
+
+      // --- Output limits (two floats LE) ---
+      case OPCODE_SET_OUTPUT_LIMITS:
+        if (plen >= 9)
+        {
+          float minV = payloadFloat();
+          float maxV;
+          memcpy(&maxV, pl + 4, sizeof(maxV));
+          dpll::setOutputLimits(minV, maxV);
+        }
+        break;
+      case OPCODE_GET_OUTPUT_LIMITS:
+      {
+        // Firmware only exposes a fixed 0..3.3 V clamp via the controller.
+        float limits[2] = {0.0f, 3.3f};
+        com::sendPacket(OPCODE_GET_OUTPUT_LIMITS, 0, (const uint8_t *)limits, sizeof(limits));
+        break;
+      }
+
+      // --- Loop enable / reset / shutdown / voltage ---
+      case OPCODE_SET_ENABLE_LOOP:
+        if (plen >= 1)
+        {
+          bool on = pl[0] != 0;
+          dpll::setManualMode(!on);
+          if (on) dpll::enable(true);
+        }
+        break;
+      case OPCODE_GET_LOOP_ENABLE:
+        sendBool(OPCODE_GET_LOOP_ENABLE, dpll::isEnabled() && !dpll::getManualMode());
+        break;
+      case OPCODE_RESET_LOOP:
+        dpll::setManualMode(false);
+        dpll::reset();
+        dpll::enable(true);
+        break;
+      case OPCODE_SHUTDOWN_LOOP:
+        dpll::shutdown();
+        break;
+      case OPCODE_SET_VOLTAGE:
+        if (plen >= 5)
+        {
+          float v = payloadFloat();
+          if (v >= 0.0f && v <= 3.3f)
+          {
+            dpll::setManualMode(true);
+            dpll::manualSet(v);
+          }
+        }
+        break;
+      case OPCODE_GET_VOLTAGE:
+        sendFloat(OPCODE_GET_VOLTAGE, dpll::lastVoltage());
+        break;
+
+      // --- Loop / acquisition config ---
+      case OPCODE_SET_LOOP_PERIOD:
+        if (plen >= 5)
+        {
+          uint32_t v = payloadU32();
+          if (v >= 1 && v <= 1000) dpll::setLoopPeriodMs(v);
+        }
+        break;
+      case OPCODE_GET_LOOP_PERIOD:
+        sendU32(OPCODE_GET_LOOP_PERIOD, dpll::getLoopPeriodMs());
+        break;
+      case OPCODE_SET_LOCK_THRESHOLD:
+        if (plen >= 5) dpll::setLockThresholdNs(payloadFloat());
+        break;
+      case OPCODE_GET_LOCK_THRESHOLD:
+        sendFloat(OPCODE_GET_LOCK_THRESHOLD, dpll::getLockThresholdNs());
+        break;
+      case OPCODE_SET_MANUAL_MODE:
+        if (plen >= 1)
+        {
+          bool on = pl[0] != 0;
+          dpll::setManualMode(on);
+          if (on) dpll::manualSet(dpll::getCenterVoltage());
+        }
+        break;
+      case OPCODE_GET_MANUAL_MODE:
+        sendBool(OPCODE_GET_MANUAL_MODE, dpll::getManualMode());
+        break;
+      case OPCODE_SET_LOCK_HOLD_CYCLES:
+        if (plen >= 5) dpll::setLockHoldCycles(payloadU32());
+        break;
+      case OPCODE_GET_LOCK_HOLD_CYCLES:
+        sendU32(OPCODE_GET_LOCK_HOLD_CYCLES, dpll::getLockHoldCycles());
+        break;
+      case OPCODE_SET_LOCK_MEMORY_TIMEOUT:
+        if (plen >= 5) dpll::setLockMemoryTimeoutMs(payloadU32());
+        break;
+      case OPCODE_GET_LOCK_MEMORY_TIMEOUT:
+        sendU32(OPCODE_GET_LOCK_MEMORY_TIMEOUT, dpll::getLockMemoryTimeoutMs());
+        break;
+      case OPCODE_SET_SIGNAL_LOSS_BEHAVIOR:
+        if (plen >= 1)
+        {
+          uint8_t b = pl[0];
+          if (b <= 2) dpll::setSignalLossBehavior((dpll::SignalLossBehavior)b);
+        }
+        break;
+      case OPCODE_GET_SIGNAL_LOSS_BEHAVIOR:
+      {
+        uint8_t b = (uint8_t)dpll::getSignalLossBehavior();
+        com::sendPacket(OPCODE_GET_SIGNAL_LOSS_BEHAVIOR, 0, &b, 1);
+        break;
+      }
+      case OPCODE_SET_STREAM_PERIOD:
+        if (plen >= 5)
+        {
+          uint32_t v = payloadU32();
+          if (v >= 1 && v <= 65535) dpll::setStreamPeriodMs(v);
+        }
+        break;
+      case OPCODE_GET_STREAM_PERIOD:
+        sendU32(OPCODE_GET_STREAM_PERIOD, dpll::getStreamPeriodMs());
+        break;
     }
   }
 }
@@ -389,10 +585,13 @@ void handleDebugCommand(const String &cmd)
   }
   else if (name == "gain")
   {
-    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | lockedV=%.3f V%s | loss=%u\n",
+    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | hold=%u | timeout=%u ms | stream=%u ms | lockedV=%.3f V%s | loss=%u\n",
                   dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
                   dpll::getTargetPhase(), dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
-                  dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(), dpll::getLockedCenterV(),
+                  dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(),
+                  dpll::getLockHoldCycles(), dpll::getLockMemoryTimeoutMs(),
+                  dpll::getStreamPeriodMs(),
+                  dpll::getLockedCenterV(),
                   dpll::haveLockedCenter() ? "" : " (default)",
                   (uint8_t)dpll::getSignalLossBehavior());
   }
