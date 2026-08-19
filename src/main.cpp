@@ -145,8 +145,9 @@ void commandProccessor()
     {
       case OPCODE_GET_VERSION:
       {
+        // Null-terminated version string — the DAQ parser reads until '\0'.
         const char *version = "DPLL v1.0";
-        com::sendPacket(OPCODE_GET_VERSION, 0, (uint8_t *)version, strlen(version));
+        com::sendPacket(OPCODE_GET_VERSION, 0, (const uint8_t *)version, strlen(version) + 1);
         break;
       }
       case OPCODE_SET_ALLOW_SEND_STREAM:
