@@ -69,7 +69,7 @@ void setup()
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising edge trigger)
   // PA1 = ZCD feedback input (Rising edge trigger)
-  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING);
+  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING, 1);
 
   // Initialize DPLL PI controller.
   // center 1.65 V. POSITIVE gains (polarity now corrected).
