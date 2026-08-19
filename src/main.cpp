@@ -110,7 +110,12 @@ void commandProccessor()
   // Drain entire RX queue per loop cycle — prevents stall on burst opcodes.
   if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
-    if (RxPacket.header.opcode == OPCODE_SET_ALLOW_SEND_STREAM)
+    if (RxPacket.header.opcode == OPCODE_GET_VERSION)
+    {
+      const char *version = "DPLL v1.0";
+      com::sendPacket(OPCODE_GET_VERSION, 0, (uint8_t *)version, strlen(version));
+    }
+    else if (RxPacket.header.opcode == OPCODE_SET_ALLOW_SEND_STREAM)
     {
       if (RxPacket.header.payloadLength >= 1)
       {
