@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include "com.h"
-#include "CircularBuffer.h"
+#include "circular_buffer.h"
 #include <USBSerial.h>
 namespace com
 {
