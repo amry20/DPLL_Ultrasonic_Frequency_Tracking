@@ -107,12 +107,18 @@ void setupSerialDebug()
 void commandProccessor()
 {
   static ComPacket RxPacket;
-  // Drain entire RX queue per loop cycle — prevents stall on burst opcodes.
+  // Process one packet per loop cycle. The loop runs far faster than the
+  // incoming packet rate, so a burst of opcodes (e.g. the host's GET refresh)
+  // is drained within a few milliseconds without blocking the control loop.
   if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
     const uint16_t opcode = RxPacket.header.opcode;
     const uint8_t *pl = RxPacket.payload;
     const uint16_t plen = RxPacket.header.payloadLength; // includes checksum byte
+
+    // Debug: print every incoming opcode so we can see what the host sends.
+    // Useful when debugging "no data" issues over the debug port (serial monitor).
+    DebugPort.printf("[RX] opcode=0x%04X len=%u\n", opcode, plen);
 
     // Payload helpers (little-endian, host sends the same layout).
     auto payloadFloat = [&]() -> float {
