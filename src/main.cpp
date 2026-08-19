@@ -270,7 +270,9 @@ void processDPLL()
         center = dpll::getLockedCenterV();
       }
       dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
-      DebugPort.printf("[RE-ACQUIRE] start center = %.3f V\n", center);
+      dpll::tickSignalAbsent(0); // reset absent timer now that signal is back
+      DebugPort.printf("[RE-ACQUIRE] start center = %.3f V%s\n", center,
+                       dpll::haveLockedCenter() ? "" : " (from nominal center, lock memory expired)");
     }
     dpll::enable(true);
     dpll::update(data.phaseDiffNs, dpll::getLoopPeriodMs() * 0.001f);
@@ -292,8 +294,8 @@ void processDPLL()
         dpll::enable(false); // DAC frozen at last position
         break;
     }
+    dpll::tickSignalAbsent(nowMs); // track how long signal has been absent
   }
-
   // Record the exact moment DAC was updated — settling window starts NOW.
   lastDacUpdate = millis();
   wasValid = data.valid;
@@ -322,6 +324,7 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  reset         : clear integrator, restart from center"));
     DebugPort.println(F("  run           : re-enable control loop"));
     DebugPort.println(F("  loss <0|1|2>  : signal-loss DAC behaviour: 0=freeze 1=center 2=zero"));
+    DebugPort.println(F("  timeout <ms>  : lock memory expiry (ms, 0=never). Default 5000"));
   }
   else if (name == "dac")
   {
@@ -439,6 +442,22 @@ void handleDebugCommand(const String &cmd)
     else
     {
       DebugPort.println("ERR: loss must be 0=freeze 1=center 2=zero");
+    }
+  }
+  else if (name == "timeout")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("Lock memory timeout = %u ms%s\n",
+                       dpll::getLockMemoryTimeoutMs(),
+                       dpll::getLockMemoryTimeoutMs() == 0 ? " (never expire)" : "");
+    }
+    else
+    {
+      uint32_t v = (uint32_t)arg.toInt();
+      dpll::setLockMemoryTimeoutMs(v);
+      DebugPort.printf("Lock memory timeout = %u ms%s\n", v,
+                       v == 0 ? " (never expire)" : "");
     }
   }
   else

@@ -41,6 +41,11 @@ uint32_t s_streamPeriodMs    = 10;   // monitor stream rate (ms); 10 ms = 100 Hz
 
 SignalLossBehavior s_signalLossBehavior = SIGNAL_LOSS_FREEZE;
 
+// Lock memory timeout
+uint32_t s_lockMemoryTimeoutMs = 5000; // 0 = never expire
+uint32_t s_signalAbsentSince   = 0;    // millis() when signal first went absent
+bool     s_signalWasAbsent     = false;
+
 } // namespace
 
 void begin(float centerVoltage, float kp, float ki, float kd)
@@ -209,7 +214,11 @@ void     setManualMode(bool v)      { s_manualMode = v; }
 
 float    getLockedCenterV()         { return s_lockedCenterV; }
 bool     haveLockedCenter()         { return s_haveLockedCenter; }
-void     setLockedCenter(float v)   { s_lockedCenterV = v; s_haveLockedCenter = true; }
+void     setLockedCenter(float v)   {
+  s_lockedCenterV    = v;
+  s_haveLockedCenter = true;
+  s_signalWasAbsent  = false; // signal present — reset absent tracker
+}
 void     clearLockedCenter()        { s_haveLockedCenter = false; s_lockedCenterV = 1.65f; }
 
 uint32_t getLockHoldCycles()        { return s_lockHoldCycles; }
@@ -220,5 +229,27 @@ void     setStreamPeriodMs(uint32_t v){ if (v >= 1) s_streamPeriodMs = v; }
 
 SignalLossBehavior getSignalLossBehavior()                    { return s_signalLossBehavior; }
 void               setSignalLossBehavior(SignalLossBehavior b) { s_signalLossBehavior = b; }
+
+uint32_t getLockMemoryTimeoutMs()          { return s_lockMemoryTimeoutMs; }
+void     setLockMemoryTimeoutMs(uint32_t ms) { s_lockMemoryTimeoutMs = ms; }
+
+void tickSignalAbsent(uint32_t nowMs)
+{
+  if (nowMs == 0) {
+    // Reset: signal returned.
+    s_signalWasAbsent = false;
+    return;
+  }
+  if (!s_signalWasAbsent) {
+    s_signalAbsentSince = nowMs;
+    s_signalWasAbsent   = true;
+  }
+  if (s_lockMemoryTimeoutMs > 0 && s_haveLockedCenter) {
+    if ((nowMs - s_signalAbsentSince) >= s_lockMemoryTimeoutMs) {
+      s_haveLockedCenter = false;
+      s_lockedCenterV    = s_centerVoltage;
+    }
+  }
+}
 
 } // namespace dpll

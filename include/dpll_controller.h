@@ -107,6 +107,17 @@ namespace dpll
     uint32_t getLockHoldCycles();
     void     setLockHoldCycles(uint32_t n);
 
+    // Lock memory timeout: if signal is absent longer than this (ms), the saved
+    // lockedCenterV is discarded and re-acquire will start from centerVoltage.
+    // Set to 0 to disable (lock memory never expires — risk of false lock on sample change).
+    // Default: 5000 ms (5 s).
+    uint32_t getLockMemoryTimeoutMs();
+    void     setLockMemoryTimeoutMs(uint32_t ms);
+
+    // Called by main loop every cycle when signal is absent.
+    // Internally tracks elapsed absent time and clears locked center on timeout.
+    void     tickSignalAbsent(uint32_t nowMs);
+
     // Monitor stream rate in milliseconds (1–65535). Default 100 ms = 10 Hz.
     // sendMonitorStream() uses this to decouple stream rate from settling window.
     uint32_t getStreamPeriodMs();
