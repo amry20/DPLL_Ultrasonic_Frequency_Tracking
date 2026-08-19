@@ -6,8 +6,10 @@ namespace com
 {
     namespace
     {
-        uint8_t rxBuffer[COM_PAYLOAD_MAX_SIZE];
-        CircularBuffer<ComPacket, 10> RxOpcodeQueue;
+        // RX queue sized for host bursts: stream-enable + a 13-opcode GET
+        // refresh arrive back-to-back. commandProccessor() drains the whole
+        // queue each loop cycle, so a modest capacity is plenty.
+        CircularBuffer<ComPacket, 32> RxOpcodeQueue;
         CircularBuffer<ComPacket, 50> TxOpcodeQueue;
         bool AllowSendStream = false;
 
@@ -44,60 +46,44 @@ namespace com
     }
     void receive_command()
     {
-        // Read one byte at a time so we can resync cleanly. SerialUSB carries
-        // ONLY binary frames (the ASCII debug protocol runs on the separate
-        // DebugPort), but a host might still send stray bytes on connect or
-        // partial/corrupt frames, so we discard bytes until we hit the 0xAA
-        // start marker, then validate the rest of the header, payload length
-        // and checksum. This byte-wise scan is also robust if the host and
-        // this code ever disagree about frame boundaries.
-        while (SerialUSB.available() > 0)
+        if (SerialUSB.available() >= COM_HEADER_SIZE)
         {
-            uint8_t first = SerialUSB.read();
-            if (first != START_BYTE)
-            {
-                // Not a frame start — discard and keep scanning.
-                continue;
-            }
-
-            // Found the start byte; need 7 more bytes for the full header.
-            if (SerialUSB.available() < 7)
-            {
-                // Not enough data yet. The 0xAA is consumed; if the rest of a
-                // real packet follows it will be misaligned, but the host
-                // resyncs on its side (it scans for 0xAA) and retransmits on
-                // refresh, so this is acceptable for the shared port.
-                break;
-            }
-
             ComPacket packet;
-            packet.header.startByte = first;
-            SerialUSB.readBytes(((uint8_t *)&packet.header) + 1, 7);
-
-            if (packet.header.endByte != END_BYTE)
+            // Read the header first
+            SerialUSB.readBytes((uint8_t *)&packet.header, COM_HEADER_SIZE);
+            // Validate the header
+            if (packet.header.startByte != START_BYTE || packet.header.endByte != END_BYTE)
             {
-                // Bad frame — rescan from the next byte.
-                continue;
+                // Invalid header, discard and return
+                return;
             }
-
-            uint16_t payloadLength = packet.header.payloadLength - 1; // length includes checksum byte
+            // Read the payload based on the length specified in the header
+            uint16_t payloadLength = packet.header.payloadLength - 1; // Exclude checksum byte
             if (payloadLength > COM_PAYLOAD_MAX_SIZE)
             {
-                continue;
+                // Payload too large, discard and return
+                return;
             }
-
-            SerialUSB.readBytes(packet.payload, payloadLength + 1); // read payload + checksum
-
+            // Wait for the full payload and checksum to be available, with a
+            // bounded timeout so a truncated frame cannot hang the control loop.
+            uint32_t waitStart = millis();
+            while (SerialUSB.available() < payloadLength + 1)
+            {
+                if (millis() - waitStart > 100)
+                {
+                    return; // timeout — drop this frame and wait for the next frame
+                }
+            }
+            SerialUSB.readBytes(packet.payload, payloadLength + 1); // +1 for checksum byte
             // Validate checksum
             uint8_t calculatedChecksum = calculate_sum(packet.payload, payloadLength);
             if (calculatedChecksum != packet.payload[payloadLength])
             {
-                continue;
+                // Checksum mismatch, discard and return
+                return;
             }
-
-            // Push the packet onto the RX queue
+            // Push the valid packet onto the RX queue
             RxOpcodeQueue.push(packet);
-            // Keep draining in case more packets are already buffered.
         }
     }
     

@@ -107,9 +107,9 @@ void setupSerialDebug()
 void commandProccessor()
 {
   static ComPacket RxPacket;
-  // Process one packet per loop cycle. The loop runs far faster than the
-  // incoming packet rate, so a burst of opcodes (e.g. the host's GET refresh)
-  // is drained within a few milliseconds without blocking the control loop.
+  // Drain the entire RX queue per loop cycle so a burst of opcodes (e.g. the
+  // host's stream-enable + 13-opcode GET refresh) is fully processed in one
+  // pass without blocking the control loop for long.
   if (com::getAvailableRxPackets(&RxPacket) != ILEGAL_OPCODE)
   {
     const uint16_t opcode = RxPacket.header.opcode;
