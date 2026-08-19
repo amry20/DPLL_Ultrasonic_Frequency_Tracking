@@ -384,10 +384,20 @@ void sendMonitorStream()
                   (data.phaseDiffNs >= -kLockThr) &&
                   (data.phaseDiffNs <=  kLockThr);
 
-  // Hold last valid phase measurement — used when ZCD is absent (DAC frozen, VCO still running).
-  static float s_lastValidPhaseNs = 0.0f;
-  if (data.zcdPresent) {
-    s_lastValidPhaseNs = data.phaseDiffNs;
+  // Phase value reported while ZCD/REF is absent. Refreshed ONLY on the first
+  // valid measurement after a missing period, so the held value reflects the
+  // true phase at the current (off-resonance) frequency — not the stale lock
+  // value from before the signal was lost (which misled operators into
+  // thinking the loop was still near resonance).
+  static bool s_haveValid = false;
+  static float s_holdPhaseNs = 0.0f;
+  if (data.valid) {
+    if (!s_haveValid) {
+      s_holdPhaseNs = data.phaseDiffNs; // first measurement after absence
+    }
+    s_haveValid = true;
+  } else {
+    s_haveValid = false;
   }
 
   dpllStatusData status;
@@ -397,10 +407,11 @@ void sendMonitorStream()
   else if (!isLocked)        status.LockStatus = 2;
   else                       status.LockStatus = 3;
   status.ReferenceFrequencyHz = data.frequencyHz;
-  // When ZCD absent: send last valid phase (DAC frozen → VCO at same freq → phase estimate still valid).
+  // While ZCD/REF is absent: send the phase captured at the first measurement
+  // after re-acquire (off-resonance value), not the pre-loss lock value.
   // PhaseStale=1 tells host this is a held value, not a fresh measurement.
-  status.PhaseError_ns        = s_lastValidPhaseNs;
-  status.PhaseStale           = data.zcdPresent ? 0 : 1;
+  status.PhaseError_ns        = data.valid ? data.phaseDiffNs : s_holdPhaseNs;
+  status.PhaseStale           = data.valid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
   status._pad[0] = status._pad[1] = 0;
   com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
