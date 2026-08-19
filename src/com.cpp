@@ -155,16 +155,20 @@ namespace com
     }
     void FlushTxQueue()
     {
-        if (TxOpcodeQueue.isEmpty())
-        {
-            return; // No packets to send
-        }
+        // Drain every queued reply in one shot so the host's paced request-
+        // response sequence never stalls waiting for a reply that is stuck
+        // behind other packets.  This is safe: SerialUSB.write() enqueues
+        // into the USB CDC TX ring (512 B after our build_flag enlargement)
+        // and returns immediately; the USB interrupt drains it in the
+        // background without touching the DPLL control path.
         ComPacket packet;
-        TxOpcodeQueue.pop(packet);
-        // Send the packet over SerialUSB
-        uint8_t Buffer[COM_HEADER_SIZE + COM_PAYLOAD_MAX_SIZE];
-        memcpy(Buffer, &packet.header, COM_HEADER_SIZE);
-        memcpy(Buffer + COM_HEADER_SIZE, packet.payload, packet.header.payloadLength);
-        SerialUSB.write(Buffer, COM_HEADER_SIZE + packet.header.payloadLength);
+        while (!TxOpcodeQueue.isEmpty())
+        {
+            TxOpcodeQueue.pop(packet);
+            uint8_t Buffer[COM_HEADER_SIZE + COM_PAYLOAD_MAX_SIZE];
+            memcpy(Buffer, &packet.header, COM_HEADER_SIZE);
+            memcpy(Buffer + COM_HEADER_SIZE, packet.payload, packet.header.payloadLength);
+            SerialUSB.write(Buffer, COM_HEADER_SIZE + packet.header.payloadLength);
+        }
     }
 }
