@@ -94,7 +94,7 @@ void loop()
   processSerialDebugCommand();
   sendMonitorStream();
   com::FlushTxQueue(); // flush any pending packets to USB
-  debugPrint();
+  //debugPrint();
   heartbeat();
 }
 
