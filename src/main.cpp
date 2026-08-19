@@ -154,6 +154,7 @@ void commandProccessor()
         if (plen >= 1)
         {
           com::SetAllowSendStream(pl[0] != 0);
+          sendBool(OPCODE_GET_ALLOW_SEND_STREAM, com::GetAllowSendStream());
         }
         break;
       case OPCODE_GET_ALLOW_SEND_STREAM:
