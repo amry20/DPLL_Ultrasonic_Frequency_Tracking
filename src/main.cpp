@@ -429,12 +429,14 @@ void processDPLL()
   static bool firstRun = true;
   static uint32_t lockHoldCount = 0;  // consecutive LOCK cycles counter
 
-  // Acquisition watchdog: counts cycles since re-acquire without improvement.
-  // If phase never improves toward target, lockedCenterV is wrong — fall back
-  // to centerVoltage and do a fresh sweep.
-  static uint32_t acqCycles    = 0;   // cycles since last re-acquire
-  static float    acqBestPhase = 1e9f; // best |phase| seen since re-acquire
-  static bool     acqActive    = false;
+  // Wrong-direction detector: during acquisition, if DAC and phase move in
+  // opposite directions for kWrongDirConfirm consecutive cycles, the start
+  // point is on the wrong side of resonance — reset to centerVoltage.
+  static bool     acqActive         = false;
+  static float    acqPrevDac        = 0.0f;
+  static float    acqPrevPhase      = 0.0f;
+  static uint32_t acqWrongDirCount  = 0;   // consecutive wrong-direction cycles
+  static uint32_t acqCycles         = 0;   // total cycles since re-acquire (fallback)
 
   uint32_t nowMs = millis();
 
@@ -498,41 +500,70 @@ void processDPLL()
       dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
       dpll::tickSignalAbsent(0); // reset absent timer now that signal is back
 
-      // Reset acquisition watchdog.
-      acqCycles    = 0;
-      acqBestPhase = fabsf(data.phaseDiffNs);
-      acqActive    = true;
+      // Reset wrong-direction detector.
+      acqPrevDac       = currentDacV;
+      acqPrevPhase     = data.phaseDiffNs;
+      acqWrongDirCount = 0;
+      acqCycles        = 0;
+      acqActive        = true;
 
       DebugPort.printf("[RE-ACQUIRE] start center = %.3f V%s\n", center,
                        dpll::haveLockedCenter() ? "" : " (nominal center)");
     }
 
-    // --- Acquisition watchdog ---
-    // If FREEZE/ZERO mode started from lockedCenterV but phase is not improving
-    // (diverging away from target), the saved center is wrong for this sample.
-    // After kAcqWatchdogCycles without improvement, clear lockedCenter and
-    // restart from centerVoltage so the loop can sweep toward true resonance.
+    // --- Wrong-direction detector ---
+    // During acquisition from lockedCenterV (FREEZE/ZERO mode), the start point
+    // may be on the wrong side of resonance: DAC moves down but phase also moves
+    // up (away from target) — positive feedback that diverges to 0 V.
+    //
+    // Detection: if sign(dDAC) != sign(dPhase) for kWrongDirConfirm consecutive
+    // cycles, we are on the wrong side.  Reset lockedCenter and restart from
+    // centerVoltage which is always above resonance (correct approach side).
+    //
+    // Also has a slow fallback: if still not locked after kAcqMaxCycles total
+    // cycles (regardless of direction), also reset — catches edge cases.
     if (acqActive && dpll::getSignalLossBehavior() != dpll::SIGNAL_LOSS_CENTER)
     {
-      constexpr uint32_t kAcqWatchdogCycles = 15; // ~300 ms at 20 ms loop
-      float absPhasNow = fabsf(data.phaseDiffNs);
-      if (absPhasNow < acqBestPhase) {
-        acqBestPhase = absPhasNow; // still converging — reset watchdog
-        acqCycles    = 0;
+      constexpr uint32_t kWrongDirConfirm = 3;   // ~60 ms at 20 ms loop
+      constexpr uint32_t kAcqMaxCycles    = 50;  // ~1 s fallback
+
+      float dDac   = currentDacV        - acqPrevDac;
+      float dPhase = data.phaseDiffNs   - acqPrevPhase;
+
+      // Wrong direction: DAC and phase move in opposite sign AND both moved
+      // meaningfully (avoid noise triggering on tiny movements).
+      constexpr float kMinDacMove   = 0.001f; // 1 mV
+      constexpr float kMinPhaseMove = 10.0f;  // 10 ns
+      bool wrongDir = (fabsf(dDac)   > kMinDacMove)   &&
+                      (fabsf(dPhase) > kMinPhaseMove)  &&
+                      ((dDac > 0.0f) != (dPhase > 0.0f)); // opposite signs
+
+      if (wrongDir) {
+        acqWrongDirCount++;
       } else {
-        acqCycles++;
+        acqWrongDirCount = 0; // any correct-direction cycle resets counter
       }
-      if (acqCycles >= kAcqWatchdogCycles) {
-        // No improvement — lockedCenterV is wrong. Fall back to centerVoltage.
+
+      acqPrevDac   = currentDacV;
+      acqPrevPhase = data.phaseDiffNs;
+      acqCycles++;
+
+      bool triggerReset = (acqWrongDirCount >= kWrongDirConfirm) ||
+                          (acqCycles        >= kAcqMaxCycles);
+      if (triggerReset) {
+        const char* reason = (acqWrongDirCount >= kWrongDirConfirm)
+                             ? "wrong direction" : "timeout";
         dpll::clearLockedCenter();
         dpll::begin(dpll::getCenterVoltage(), dpll::getKp(), dpll::getKi(), dpll::getKd());
-        acqCycles    = 0;
-        acqBestPhase = 1e9f;
-        DebugPort.printf("[ACQ WATCHDOG] no convergence — reset to centerVoltage=%.3f V\n",
-                         dpll::getCenterVoltage());
+        acqWrongDirCount = 0;
+        acqCycles        = 0;
+        acqPrevDac       = dpll::getCenterVoltage();
+        acqPrevPhase     = data.phaseDiffNs;
+        DebugPort.printf("[ACQ RESET] %s — restart from centerV=%.3f V\n",
+                         reason, dpll::getCenterVoltage());
       }
     }
-    if (isLocked) { acqActive = false; } // watchdog off once locked
+    if (isLocked) { acqActive = false; } // detector off once locked
 
     dpll::enable(true);
     dpll::update(data.phaseDiffNs, dpll::getLoopPeriodMs() * 0.001f);
