@@ -429,6 +429,13 @@ void processDPLL()
   static bool firstRun = true;
   static uint32_t lockHoldCount = 0;  // consecutive LOCK cycles counter
 
+  // Acquisition watchdog: counts cycles since re-acquire without improvement.
+  // If phase never improves toward target, lockedCenterV is wrong — fall back
+  // to centerVoltage and do a fresh sweep.
+  static uint32_t acqCycles    = 0;   // cycles since last re-acquire
+  static float    acqBestPhase = 1e9f; // best |phase| seen since re-acquire
+  static bool     acqActive    = false;
+
   uint32_t nowMs = millis();
 
   // On first run, start the settling timer immediately without updating DAC.
@@ -478,8 +485,7 @@ void processDPLL()
     {
       // Re-acquire: choose start center based on signal-loss behaviour.
       // FREEZE/ZERO : start from locked center (known good operating point).
-      // CENTER      : DAC already at centerVoltage after reset() — start from there
-      //               to avoid a sudden DAC step back to lockedCenterV.
+      // CENTER      : DAC already at centerVoltage after reset() — start from there.
       float center;
       if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER)
       {
@@ -491,9 +497,43 @@ void processDPLL()
       }
       dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
       dpll::tickSignalAbsent(0); // reset absent timer now that signal is back
+
+      // Reset acquisition watchdog.
+      acqCycles    = 0;
+      acqBestPhase = fabsf(data.phaseDiffNs);
+      acqActive    = true;
+
       DebugPort.printf("[RE-ACQUIRE] start center = %.3f V%s\n", center,
-                       dpll::haveLockedCenter() ? "" : " (from nominal center, lock memory expired)");
+                       dpll::haveLockedCenter() ? "" : " (nominal center)");
     }
+
+    // --- Acquisition watchdog ---
+    // If FREEZE/ZERO mode started from lockedCenterV but phase is not improving
+    // (diverging away from target), the saved center is wrong for this sample.
+    // After kAcqWatchdogCycles without improvement, clear lockedCenter and
+    // restart from centerVoltage so the loop can sweep toward true resonance.
+    if (acqActive && dpll::getSignalLossBehavior() != dpll::SIGNAL_LOSS_CENTER)
+    {
+      constexpr uint32_t kAcqWatchdogCycles = 15; // ~300 ms at 20 ms loop
+      float absPhasNow = fabsf(data.phaseDiffNs);
+      if (absPhasNow < acqBestPhase) {
+        acqBestPhase = absPhasNow; // still converging — reset watchdog
+        acqCycles    = 0;
+      } else {
+        acqCycles++;
+      }
+      if (acqCycles >= kAcqWatchdogCycles) {
+        // No improvement — lockedCenterV is wrong. Fall back to centerVoltage.
+        dpll::clearLockedCenter();
+        dpll::begin(dpll::getCenterVoltage(), dpll::getKp(), dpll::getKi(), dpll::getKd());
+        acqCycles    = 0;
+        acqBestPhase = 1e9f;
+        DebugPort.printf("[ACQ WATCHDOG] no convergence — reset to centerVoltage=%.3f V\n",
+                         dpll::getCenterVoltage());
+      }
+    }
+    if (isLocked) { acqActive = false; } // watchdog off once locked
+
     dpll::enable(true);
     dpll::update(data.phaseDiffNs, dpll::getLoopPeriodMs() * 0.001f);
   }
