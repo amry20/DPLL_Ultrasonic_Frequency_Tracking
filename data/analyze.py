@@ -1,26 +1,60 @@
 import csv
 import sys
+from collections import Counter
 
-fname29 = r'D:\National Seismic Instrument\Release\Firmware\Source\DPLL_Ultrasonic_Frequency_Tracking\data\29 DPLL.csv'
-fname5  = r'D:\National Seismic Instrument\Release\Firmware\Source\DPLL_Ultrasonic_Frequency_Tracking\data\5 DPLL.csv'
+fname = sys.argv[1] if len(sys.argv) > 1 else r'D:\National Seismic Instrument\Release\Firmware\Source\DPLL_Ultrasonic_Frequency_Tracking\data\New Fw Fix 1.csv'
+rows = list(csv.DictReader(open(fname)))
+print(f"File : {fname}")
+print(f"Rows : {len(rows)}")
 
-for fname, label in [(fname29, "=== 29 DPLL (FREEZE) ==="), (fname5, "=== 5 DPLL (CENTER) ===")]:
-    rows = list(csv.DictReader(open(fname)))
-    print(label)
+# --- State summary ---
+states = Counter(r['LockState'] for r in rows)
+print("\n=== State counts ===")
+for s, n in sorted(states.items()):
+    print(f"  {s:12s} {n:6d}  ({100*n/len(rows):.1f}%)")
 
-    # Find first TRACK row index
-    first_track = next((i for i,r in enumerate(rows) if r['LockState']=='TRACK'), None)
-    if first_track is None:
-        print("  No TRACK found"); continue
+# --- State transitions ---
+print("\n=== State transitions ===")
+prev = None
+for i, r in enumerate(rows):
+    s = r['LockState']
+    if s != prev:
+        dac = float(r['DACVoltage_V'])
+        ph  = float(r['PhaseErrorNs'])
+        print(f"  Row {i+1:5d} | {prev or 'START':10s} -> {s:10s} | DAC={dac:7.4f} V | Phase={ph:9.1f} ns")
+        prev = s
 
-    # Show 5 rows before and 10 rows into TRACK
-    start = max(0, first_track - 5)
-    end   = min(len(rows), first_track + 10)
-    for i in range(start, end):
-        r = rows[i]
-        marker = " <<< TRACK starts" if i == first_track else ""
-        print(f"  Row {i+1:5d} | {r['LockState']:10s} | DAC={float(r['DACVoltage_V']):7.4f} V | Phase={float(r['PhaseErrorNs']):9.1f} ns | Stale={r['PhaseStale']}{marker}")
-    print()
+# --- LOCK stats ---
+lock_rows = [r for r in rows if r['LockState']=='LOCK']
+if lock_rows:
+    dacs = [float(r['DACVoltage_V']) for r in lock_rows]
+    print(f"\n=== LOCK stats ({len(lock_rows)} rows) ===")
+    print(f"  DAC min={min(dacs):.4f} V  max={max(dacs):.4f} V  mean={sum(dacs)/len(dacs):.4f} V")
+
+# --- First TRACK session row-by-row ---
+print("\n=== First TRACK session (row by row) ===")
+in_track = False
+count = 0
+prev_dac = None; prev_ph = None
+for i, r in enumerate(rows):
+    if r['LockState'] == 'TRACK':
+        if not in_track:
+            in_track = True
+        dac = float(r['DACVoltage_V'])
+        ph  = float(r['PhaseErrorNs'])
+        ddac  = (dac - prev_dac)  if prev_dac  is not None else 0.0
+        dph   = (ph  - prev_ph)   if prev_ph   is not None else 0.0
+        wrong = (abs(ddac)>0.001 and abs(dph)>10) and ((ddac>0) != (dph>0))
+        flag  = " <WRONG DIR>" if wrong else ""
+        print(f"  Row {i+1:5d} | DAC={dac:7.4f} V (d={ddac:+.4f}) | Phase={ph:9.1f} ns (d={dph:+.1f}){flag}")
+        prev_dac = dac; prev_ph = ph
+        count += 1
+        if count >= 60:
+            print("  ... (truncated at 60 rows)")
+            break
+    else:
+        if in_track:
+            break  # end of first TRACK session
 
 # State counts
 c = Counter(r['LockState'] for r in rows)
