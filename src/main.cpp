@@ -434,7 +434,6 @@ void processDPLL()
   // point is on the wrong side of resonance — reset to centerVoltage.
   static bool     acqActive         = false;
   static float    acqPrevDac        = 0.0f;
-  static float    acqPrevPhase      = 0.0f;
   static uint32_t acqWrongDirCount  = 0;   // consecutive wrong-direction cycles
   static uint32_t acqCycles         = 0;   // total cycles since re-acquire (fallback)
 
@@ -502,7 +501,6 @@ void processDPLL()
 
       // Reset wrong-direction detector.
       acqPrevDac       = currentDacV;
-      acqPrevPhase     = data.phaseDiffNs;
       acqWrongDirCount = 0;
       acqCycles        = 0;
       acqActive        = true;
@@ -527,16 +525,24 @@ void processDPLL()
       constexpr uint32_t kWrongDirConfirm = 3;   // ~60 ms at 20 ms loop
       constexpr uint32_t kAcqMaxCycles    = 50;  // ~1 s fallback
 
-      float dDac   = currentDacV        - acqPrevDac;
-      float dPhase = data.phaseDiffNs   - acqPrevPhase;
+      float dDac   = currentDacV - acqPrevDac;
 
-      // Wrong direction: DAC and phase move in opposite sign AND both moved
-      // meaningfully (avoid noise triggering on tiny movements).
-      constexpr float kMinDacMove   = 0.001f; // 1 mV
-      constexpr float kMinPhaseMove = 10.0f;  // 10 ns
-      bool wrongDir = (fabsf(dDac)   > kMinDacMove)   &&
-                      (fabsf(dPhase) > kMinPhaseMove)  &&
-                      ((dDac > 0.0f) != (dPhase > 0.0f)); // opposite signs
+      // Wrong direction: only check when phase is far from resonance
+      // (> 5x lockThreshold). Near resonance, phase can swing either way
+      // as the loop converges — checking direction there causes false resets.
+      //
+      // Logic: error = target - phase.
+      //   error > 0 → phase below target → freq too low → DAC must rise
+      //   error < 0 → phase above target → freq too high → DAC must fall
+      // If DAC moves opposite to what error demands, we are diverging.
+      constexpr float kMinDacMove      = 0.002f; // 2 mV — ignore noise
+      constexpr float kFarZoneMultiple = 5.0f;   // only active far from lock
+      float absPhaseNow = fabsf(data.phaseDiffNs);
+      float farZone     = kFarZoneMultiple * dpll::getLockThresholdNs();
+      float error       = dpll::getTargetPhase() - data.phaseDiffNs;
+      bool wrongDir = (absPhaseNow > farZone)              &&
+                      (fabsf(dDac) > kMinDacMove)          &&
+                      ((error > 0.0f) != (dDac > 0.0f));  // DAC opposes error
 
       if (wrongDir) {
         acqWrongDirCount++;
@@ -545,7 +551,6 @@ void processDPLL()
       }
 
       acqPrevDac   = currentDacV;
-      acqPrevPhase = data.phaseDiffNs;
       acqCycles++;
 
       bool triggerReset = (acqWrongDirCount >= kWrongDirConfirm) ||
@@ -558,7 +563,6 @@ void processDPLL()
         acqWrongDirCount = 0;
         acqCycles        = 0;
         acqPrevDac       = dpll::getCenterVoltage();
-        acqPrevPhase     = data.phaseDiffNs;
         DebugPort.printf("[ACQ RESET] %s — restart from centerV=%.3f V\n",
                          reason, dpll::getCenterVoltage());
       }
