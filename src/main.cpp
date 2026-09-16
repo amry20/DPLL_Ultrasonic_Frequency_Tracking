@@ -418,182 +418,153 @@ void sendMonitorStream()
 }
 void processDPLL()
 {
-  // --- DPLL control loop ---
+  // --- DPLL State Machine & Control Loop ---
   // Sequence per cycle:
-  //   1. DAC was updated at lastDacUpdate.
-  //   2. Wait g_loopPeriodMs ms for transducer to settle.
-  //   3. Read phase (getData) AFTER settling is complete.
-  //   4. Update DAC -> record lastDacUpdate, start next settling window.
-  static uint32_t lastDacUpdate = 0;
-  static bool wasValid = false;
-  static bool firstRun = true;
-  static uint32_t lockHoldCount = 0;  // consecutive LOCK cycles counter
+  //   1. Wait loopPeriodMs for system & transducer settling.
+  //   2. Read fresh phase data from phase_capture.
+  //   3. Handle state transitions: NO_SIGNAL -> ACQUIRING -> TRACKING -> LOCKED.
+  //   4. Execute PI controller update and apply DAC voltage.
+  //   5. Record timestamp for next settling window.
 
-  // Wrong-direction detector: during acquisition, if DAC and phase move in
-  // opposite directions for kWrongDirConfirm consecutive cycles, the start
-  // point is on the wrong side of resonance — reset to centerVoltage.
-  static bool     acqActive         = false;
-  static float    acqPrevDac        = 0.0f;
-  static uint32_t acqWrongDirCount  = 0;   // consecutive wrong-direction cycles
-  static uint32_t acqCycles         = 0;   // total cycles since re-acquire (fallback)
+  enum DpllState : uint8_t {
+    STATE_NO_SIGNAL = 0,
+    STATE_ACQUIRING,
+    STATE_TRACKING,
+    STATE_LOCKED
+  };
+
+  static DpllState state = STATE_NO_SIGNAL;
+  static uint32_t lastDacUpdate = 0;
+  static bool firstRun = true;
+  static uint32_t lockHoldCount = 0;
+  static uint32_t railClampCount = 0;
+  static uint32_t trackCycles = 0;
 
   uint32_t nowMs = millis();
 
-  // On first run, start the settling timer immediately without updating DAC.
   if (firstRun) {
     lastDacUpdate = nowMs;
     firstRun = false;
     return;
   }
 
-  // Wait until settling window expires before reading phase.
+  // Wait until settling window expires
   if (nowMs - lastDacUpdate < dpll::getLoopPeriodMs()) {
     return;
   }
 
-  // Settling done — read phase NOW (transducer has settled after last DAC step).
+  float dt = dpll::getLoopPeriodMs() * 0.001f;
   phase_capture::CaptureData data = phase_capture::getData();
-
-  // --- Lock-point memory ---
-  // Track consecutive LOCK cycles. Once stable for kLockHoldCycles,
-  // save current DAC voltage as the new center for next re-acquire.
   float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
   const float kLockThr = dpll::getLockThresholdNs();
-  bool isLocked = data.valid &&
-                  (data.phaseDiffNs >= -kLockThr) &&
-                  (data.phaseDiffNs <=  kLockThr);
-  if (isLocked) {
+
+  // Manual override: loop disengaged
+  if (dpll::getManualMode()) {
+    lastDacUpdate = millis();
+    return;
+  }
+
+  // Check signal presence
+  if (!data.valid) {
+    state = STATE_NO_SIGNAL;
+    lockHoldCount = 0;
+    railClampCount = 0;
+    trackCycles = 0;
+
+    switch (dpll::getSignalLossBehavior())
+    {
+      case dpll::SIGNAL_LOSS_CENTER:
+        dpll::reset();       // DAC -> centerVoltage, clear integral
+        dpll::enable(false);
+        break;
+      case dpll::SIGNAL_LOSS_ZERO:
+        dpll::shutdown();    // DAC -> 0 V
+        break;
+      case dpll::SIGNAL_LOSS_FREEZE:
+      default:
+        dpll::enable(false); // Hold last DAC
+        break;
+    }
+    dpll::tickSignalAbsent(nowMs);
+    lastDacUpdate = millis();
+    return;
+  }
+
+  // Signal is valid
+  dpll::tickSignalAbsent(0); // Signal present
+
+  // State Transition & Re-acquisition logic
+  if (state == STATE_NO_SIGNAL) {
+    float startV;
+    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER || !dpll::haveLockedCenter()) {
+      startV = dpll::getCenterVoltage();
+      dpll::reset();
+    } else {
+      startV = dpll::getLockedCenterV();
+      dpll::restartAtVoltage(startV);
+    }
+    state = STATE_ACQUIRING;
+    lockHoldCount = 0;
+    railClampCount = 0;
+    trackCycles = 0;
+    DebugPort.printf("[DPLL] Re-acquire start at %.3f V (Freq: %.1f Hz)\n", startV, data.frequencyHz);
+  }
+
+  // Run PI controller update
+  dpll::enable(true);
+  float newDacV = dpll::update(data.phaseDiffNs, dt);
+  trackCycles++;
+
+  // Check if controller is pinned to rails (0.0 V or 3.3 V)
+  if (newDacV <= 0.005f || newDacV >= 3.295f) {
+    railClampCount++;
+  } else {
+    railClampCount = 0;
+  }
+
+  // Anti-Divergence / Rail Recovery
+  // If stuck on rails for 10 cycles (~200ms) or tracking over 150 cycles (~3s) without locking,
+  // reset back to center voltage to recover.
+  constexpr uint32_t kMaxRailCycles = 10;
+  constexpr uint32_t kMaxTrackCycles = 150;
+  if (railClampCount >= kMaxRailCycles || (state == STATE_TRACKING && trackCycles >= kMaxTrackCycles)) {
+    DebugPort.printf("[DPLL RECOVERY] %s — resetting to center voltage %.3f V\n",
+                     (railClampCount >= kMaxRailCycles) ? "Rail Clamped" : "Track Timeout",
+                     dpll::getCenterVoltage());
+    dpll::clearLockedCenter();
+    dpll::reset();
+    state = STATE_ACQUIRING;
+    railClampCount = 0;
+    trackCycles = 0;
+    lockHoldCount = 0;
+    lastDacUpdate = millis();
+    return;
+  }
+
+  // Check Lock Condition
+  bool withinLockWindow = (fabsf(data.phaseDiffNs - dpll::getTargetPhase()) <= kLockThr);
+
+  if (withinLockWindow) {
     lockHoldCount++;
     if (lockHoldCount >= dpll::getLockHoldCycles()) {
-      // Lock confirmed stable — update center voltage memory.
-      if (!dpll::haveLockedCenter() || (currentDacV != dpll::getLockedCenterV())) {
-        dpll::setLockedCenter(currentDacV);
-        DebugPort.printf("[LOCK SAVED] center = %.3f V\n", currentDacV);
+      if (state != STATE_LOCKED) {
+        state = STATE_LOCKED;
+        dpll::setLockedCenter(newDacV);
+        DebugPort.printf("[DPLL LOCKED] DAC = %.3f V | Freq = %.1f Hz | Phase = %.1f ns\n",
+                         newDacV, data.frequencyHz, data.phaseDiffNs);
       }
     }
   } else {
     lockHoldCount = 0;
-  }
-
-  // Update DAC — record timestamp immediately after update to start next settling window.
-  if (dpll::getManualMode())
-  {
-    // Manual: keep DAC as user set it; do not run the loop.
-  }
-  else if (data.valid)
-  {
-    if (!wasValid)
-    {
-      // Re-acquire: choose start center based on signal-loss behaviour.
-      // FREEZE/ZERO : start from locked center (known good operating point).
-      // CENTER      : DAC already at centerVoltage after reset() — start from there.
-      float center;
-      if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER)
-      {
-        center = dpll::getCenterVoltage();
-      }
-      else
-      {
-        center = dpll::getLockedCenterV();
-      }
-      dpll::begin(center, dpll::getKp(), dpll::getKi(), dpll::getKd());
-      dpll::tickSignalAbsent(0); // reset absent timer now that signal is back
-
-      // Reset wrong-direction detector.
-      acqPrevDac       = currentDacV;
-      acqWrongDirCount = 0;
-      acqCycles        = 0;
-      acqActive        = true;
-
-      DebugPort.printf("[RE-ACQUIRE] start center = %.3f V%s\n", center,
-                       dpll::haveLockedCenter() ? "" : " (nominal center)");
+    if (state == STATE_LOCKED) {
+      state = STATE_TRACKING;
+      DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns\n", data.phaseDiffNs);
+    } else if (state == STATE_ACQUIRING) {
+      state = STATE_TRACKING;
     }
-
-    // --- Wrong-direction detector ---
-    // During acquisition from lockedCenterV (FREEZE/ZERO mode), the start point
-    // may be on the wrong side of resonance: DAC moves down but phase also moves
-    // up (away from target) — positive feedback that diverges to 0 V.
-    //
-    // Detection: if sign(dDAC) != sign(dPhase) for kWrongDirConfirm consecutive
-    // cycles, we are on the wrong side.  Reset lockedCenter and restart from
-    // centerVoltage which is always above resonance (correct approach side).
-    //
-    // Also has a slow fallback: if still not locked after kAcqMaxCycles total
-    // cycles (regardless of direction), also reset — catches edge cases.
-    if (acqActive && dpll::getSignalLossBehavior() != dpll::SIGNAL_LOSS_CENTER)
-    {
-      constexpr uint32_t kWrongDirConfirm = 3;   // ~60 ms at 20 ms loop
-      constexpr uint32_t kAcqMaxCycles    = 50;  // ~1 s fallback
-
-      float dDac   = currentDacV - acqPrevDac;
-
-      // Wrong direction: only check when phase is far from resonance
-      // (> 5x lockThreshold). Near resonance, phase can swing either way
-      // as the loop converges — checking direction there causes false resets.
-      //
-      // Logic: error = target - phase.
-      //   error > 0 → phase below target → freq too low → DAC must rise
-      //   error < 0 → phase above target → freq too high → DAC must fall
-      // If DAC moves opposite to what error demands, we are diverging.
-      constexpr float kMinDacMove      = 0.002f; // 2 mV — ignore noise
-      constexpr float kFarZoneMultiple = 5.0f;   // only active far from lock
-      float absPhaseNow = fabsf(data.phaseDiffNs);
-      float farZone     = kFarZoneMultiple * dpll::getLockThresholdNs();
-      float error       = dpll::getTargetPhase() - data.phaseDiffNs;
-      bool wrongDir = (absPhaseNow > farZone)              &&
-                      (fabsf(dDac) > kMinDacMove)          &&
-                      ((error > 0.0f) != (dDac > 0.0f));  // DAC opposes error
-
-      if (wrongDir) {
-        acqWrongDirCount++;
-      } else {
-        acqWrongDirCount = 0; // any correct-direction cycle resets counter
-      }
-
-      acqPrevDac   = currentDacV;
-      acqCycles++;
-
-      bool triggerReset = (acqWrongDirCount >= kWrongDirConfirm) ||
-                          (acqCycles        >= kAcqMaxCycles);
-      if (triggerReset) {
-        const char* reason = (acqWrongDirCount >= kWrongDirConfirm)
-                             ? "wrong direction" : "timeout";
-        dpll::clearLockedCenter();
-        dpll::begin(dpll::getCenterVoltage(), dpll::getKp(), dpll::getKi(), dpll::getKd());
-        acqWrongDirCount = 0;
-        acqCycles        = 0;
-        acqPrevDac       = dpll::getCenterVoltage();
-        DebugPort.printf("[ACQ RESET] %s — restart from centerV=%.3f V\n",
-                         reason, dpll::getCenterVoltage());
-      }
-    }
-    if (isLocked) { acqActive = false; } // detector off once locked
-
-    dpll::enable(true);
-    dpll::update(data.phaseDiffNs, dpll::getLoopPeriodMs() * 0.001f);
   }
-  else
-  {
-    // Signal missing — behaviour set by setSignalLossBehavior().
-    switch (dpll::getSignalLossBehavior())
-    {
-      case dpll::SIGNAL_LOSS_CENTER:
-        dpll::reset();       // DAC → centerVoltage, clear integrator
-        dpll::enable(false);
-        break;
-      case dpll::SIGNAL_LOSS_ZERO:
-        dpll::shutdown();    // DAC → 0 V, clear integrator
-        break;
-      case dpll::SIGNAL_LOSS_FREEZE:
-      default:
-        dpll::enable(false); // DAC frozen at last position
-        break;
-    }
-    dpll::tickSignalAbsent(nowMs); // track how long signal has been absent
-  }
-  // Record the exact moment DAC was updated — settling window starts NOW.
+
   lastDacUpdate = millis();
-  wasValid = data.valid;
 }
 // Parse and execute one full command line (already trimmed).
 void handleDebugCommand(const String &cmd)

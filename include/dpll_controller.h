@@ -60,6 +60,10 @@ namespace dpll
     // Clear the integrator and return the output to centerVoltage.
     void reset();
 
+    // Re-initialize controller for tracking from a specific starting voltage
+    // (bumpless restart without step jump).
+    void restartAtVoltage(float startingVoltage);
+
     // Run one control step.
     // phaseErrorNs : measured phase difference in nanoseconds (from phase_capture).
     // dtSeconds    : time since the previous update call, in seconds.

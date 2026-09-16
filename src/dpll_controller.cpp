@@ -109,6 +109,18 @@ void reset()
   dac::setVoltage(s_outputVoltage);
 }
 
+void restartAtVoltage(float startingVoltage)
+{
+  if (startingVoltage < s_minVoltage) startingVoltage = s_minVoltage;
+  if (startingVoltage > s_maxVoltage) startingVoltage = s_maxVoltage;
+  s_outputVoltage = startingVoltage;
+  // Initialize integral so that V = center + integral = startingVoltage (assuming e = 0 initially)
+  s_integral = startingVoltage - s_centerVoltage;
+  s_haveLastError = false;
+  s_enabled = true;
+  dac::setVoltage(s_outputVoltage);
+}
+
 float update(float phaseErrorNs, float dtSeconds)
 {
   if (!s_enabled) {
