@@ -128,10 +128,16 @@ namespace eeprom_config
             }
         }
 
-        // Apply loaded configuration to DPLL controller
         dpll::begin(cfg.centerVoltage, cfg.kp, cfg.ki, cfg.kd);
         dpll::setTargetPhase(cfg.targetPhase);
-        dpll::setMaxSlew(cfg.maxSlew);
+        if (cfg.version >= 2 && cfg.generatorSource == 1)
+        {
+            dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
+        }
+        else
+        {
+            dpll::setMaxSlew(cfg.maxSlew);
+        }
         dpll::setLoopPeriodMs(cfg.loopPeriodMs);
         dpll::setLockThresholdNs(cfg.lockThresholdNs);
         dpll::setLockHoldCycles(cfg.lockHoldCycles);

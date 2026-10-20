@@ -204,12 +204,16 @@ void setOutputLimits(float minV, float maxV)
   s_maxVoltage = maxV;
 }
 
-void setMaxSlew(float voltsPerSecond)
+void setMaxSlew(float ratePerSecond)
 {
-  if (voltsPerSecond <= 0.0f) {
-    voltsPerSecond = 30.0f;
+  if (ratePerSecond <= 0.0f) {
+    ratePerSecond = (s_generatorSource == GENERATOR_SOURCE_DDS) ? 20000.0f : 30.0f;
   }
-  s_maxSlew = voltsPerSecond;
+  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+    s_ddsMaxSlew = ratePerSecond;
+  } else {
+    s_maxSlew = ratePerSecond;
+  }
 }
 
 void enable(bool on)
