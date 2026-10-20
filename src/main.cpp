@@ -48,6 +48,7 @@ extern "C" void SystemClock_Config(void)
 }
 
 #define HEARTBEAT_LED PC_13
+#define LOCK_INDICATOR_LED PC_10 // active high. Lock indictor when state change to Locked.
 void heartbeat();
 void processSerialDebugCommand();
 void processDPLL();
@@ -64,6 +65,8 @@ void setup()
   com::begin();
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
+  pinMode(digitalPinToPinName(LOCK_INDICATOR_LED), OUTPUT);
+  digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
 
   // 1. Initialize 24LC16B I2C EEPROM on PB6 (SCL) and PB7 (SDA)
   if (eeprom::begin(PB6, PB7, 400000))
@@ -615,6 +618,7 @@ void processDPLL()
 
   // Manual override: loop disengaged
   if (dpll::getManualMode()) {
+    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
@@ -623,6 +627,7 @@ void processDPLL()
   // Check signal presence
   if (!data.valid) {
     state = STATE_NO_SIGNAL;
+    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
     lockHoldCount = 0;
     railClampCount = 0;
     trackCycles = 0;
@@ -657,6 +662,7 @@ void processDPLL()
   if (!window.trustworthy) {
     lockHoldCount = 0;
     if (state == STATE_LOCKED) state = STATE_TRACKING;
+    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), (state == STATE_LOCKED) ? HIGH : LOW);
 
     static uint32_t lastFilterLogMs = 0;
     if (nowMs - lastFilterLogMs >= 500U) {
@@ -723,6 +729,7 @@ void processDPLL()
     railClampCount = 0;
     trackCycles = 0;
     lockHoldCount = 0;
+    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
@@ -750,6 +757,9 @@ void processDPLL()
       state = STATE_TRACKING;
     }
   }
+
+  // Update hardware lock indicator LED (active high)
+  digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), (state == STATE_LOCKED) ? HIGH : LOW);
 
   phase_capture::clearWindowData();
   lastDacUpdate = millis();

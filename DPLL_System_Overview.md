@@ -164,3 +164,23 @@ The STM32F407 generates the master clock (`MCLK`) for the AD9833 DDS generator v
 | **4** | `HSI 16MHz (/1)`| HSI / 1 (Internal RC) | 16,000,000 Hz | **0.059605 Hz** (~0.060 Hz) | 62.5 ns | Fastest clock edge (minimum discrete delay), ~1% RC drift. |
 | **5** | `HSI 8MHz (/2)` | HSI / 2 (Internal RC) | 8,000,000 Hz | **0.029802 Hz** (~0.030 Hz) | 125 ns | Standard resolution fallback when external crystal is absent. |
 | **6** | `HSI 4MHz (/4)` | HSI / 4 (Internal RC) | 4,000,000 Hz | **0.014901 Hz** (~0.015 Hz) | 250 ns | High resolution fallback using internal oscillator. |
+
+---
+
+## 7. STM32F407 Hardware Pin Assignment
+
+| Pin | Function / Peripheral | Description |
+|---|---|---|
+| `PA0` | TIM2_CH1 (Input Capture) | Reference driving signal (square wave, rising-edge trigger) |
+| `PA1` | TIM2_CH2 (Input Capture) | Zero-crossing detector (ZCD) current feedback signal (rising-edge trigger) |
+| `PA4` | DAC1_OUT1 (Analog Output)| External CD4046 VCO control voltage (0.0 V – 3.3 V) |
+| `PA8` | MCO1 (Clock Output)      | AD9833 Master Clock (`MCLK`), selectable HSE/HSI preset (1.6 MHz – 16 MHz) |
+| `PC4` | GPIO Output (FSYNC)      | AD9833 Chip Select / SPI Frame Sync (Active LOW) |
+| `PA5` | SPI1_SCK                 | AD9833 Serial Clock |
+| `PA7` | SPI1_MOSI                | AD9833 Serial Data (`SDATA`) |
+| `PB6` | I2C1_SCL (400 kHz)       | 24LC16B EEPROM I2C Clock |
+| `PB7` | I2C1_SDA (400 kHz)       | 24LC16B EEPROM I2C Data |
+| `PA9` | USART1_TX (115200 baud)  | Serial Debug UART Transmit |
+| `PA10`| USART1_RX (115200 baud)  | Serial Debug UART Receive |
+| `PC13`| GPIO Output (Active LOW) | System Heartbeat LED (Toggles every 500 ms) |
+| `PC10`| GPIO Output (Active HIGH)| **Lock Indicator LED** (Lights up HIGH when DPLL state is `LOCKED`) |
