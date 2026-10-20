@@ -42,6 +42,22 @@ struct CaptureData {
   bool     valid;           // True if both REF and ZCD are valid & current
 };
 
+// Robust result calculated from every paired REF/ZCD sample collected during
+// one control window.  The ISR only records integer timer values; all floating
+// point filtering is performed when consumeWindowData() is called from loop().
+struct PhaseWindowData {
+  float    phaseDiffNs;       // Robust phase estimate at the end of the window
+  float    phaseDegrees;      // Same estimate, wrapped to [-180, +180] degrees
+  float    slopeDegPerMs;     // Robust phase trend across the window
+  float    noiseMadDeg;       // Robust residual noise estimate (1-sigma MAD)
+  float    outlierRatio;      // Fraction of samples rejected [0, 1]
+  uint16_t sampleCount;       // Paired REF/ZCD samples captured in this window
+  uint16_t acceptedCount;     // Samples retained by the robust estimator
+  bool     overflow;          // Sample bank filled before the window ended
+  bool     largeShift;        // Large intra/inter-window phase movement detected
+  bool     trustworthy;       // Safe to feed this estimate to the PID
+};
+
 // Configurable setup function.
 // refPin  : defaults to PA0 (TIM2_CH1)
 // zcdPin  : defaults to PA1 (TIM2_CH2)
@@ -68,8 +84,17 @@ void setZcdEdge(EdgePolarity edge);
 // Get the latest snapshot of captured phase & period metrics
 CaptureData getData();
 
+// Atomically close the current capture window, start a fresh one, and process
+// all samples from the closed window. Intended to be called once per PID period
+// (20 ms by default). A low-confidence result must not be sent to the PID.
+PhaseWindowData consumeWindowData();
+
+// Discard samples captured while the previous window was being processed.
+// Call immediately after applying (or deliberately holding) the DAC so the
+// next 20 ms measurement window starts at the actual control decision time.
+void clearWindowData();
+
 // Helper: convert TIM2 ticks to microseconds
 float ticksToUs(uint32_t ticks);
 
 } // namespace phase_capture
-

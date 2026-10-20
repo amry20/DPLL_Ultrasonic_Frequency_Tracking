@@ -14,12 +14,14 @@ The complete signal chain consists of a phase capture stage (dual-channel TIM2 i
 
 The DPLL operates as a negative-feedback control system that steers the transducer driving frequency until the current and the driving voltage are in phase (resonance). The loop runs at a fixed rate (default 20 ms) and follows this cycle every step:
 
-1. **Measure** — The 32-bit hardware timer `TIM2` (clocked at 84 MHz, ~11.9 ns resolution) timestamps the rising edge of the reference square wave on `PA0` and the rising edge of the zero-crossing-detector (ZCD) square wave on `PA1`.
-2. **Compute phase error** — The raw time difference `(ZCD timestamp − REF timestamp)` is wrapped into the range `[−period/2, +period/2]` and converted to nanoseconds. This is the measured phase `φ_measured`.
-3. **Calculate error** — `error = φ_target − φ_measured`, where `φ_target = 0 ns` (target phase). A positive error means the loop is below resonance; a negative error means it is above resonance.
-4. **Compute control voltage** — A PID law converts the error into a voltage offset.
-5. **Actuate** — The 12-bit DAC (`PA4`) applies the voltage to the CD4046 VCO, which shifts the frequency toward resonance.
-6. **Repeat** — The next cycle re-measures the phase and corrects again until `error ≈ 0`.
+1. **Capture the full window** — The 32-bit hardware timer `TIM2` (clocked at 84 MHz, ~11.9 ns resolution) timestamps every rising edge of the reference square wave on `PA0` and the zero-crossing-detector (ZCD) square wave on `PA1`. Each paired integer sample is placed in an ISR-safe double buffer throughout the 20 ms settling window.
+2. **Wrap each sample** — Each raw time difference `(ZCD timestamp − REF timestamp)` is wrapped into `[−period/2, +period/2]`. Circular phase differences are used so a normal `+180°` to `−180°` crossing is not mistaken for a spike.
+3. **Estimate window confidence** — Samples are reduced to chronological block medians, fitted with a robust Theil-Sen trend, and screened with median-absolute-deviation (MAD) gates. The result contains end-of-window phase, slope, noise, outlier ratio, overflow status, and a confidence flag.
+4. **Gate the controller** — A low-confidence, overflowing, spiking, or abruptly shifted window holds the DAC and freezes the PID integral. A large clean inter-window shift must repeat in a second clean window before it is accepted.
+5. **Calculate error** — For a trusted window, `error = φ_target − φ_filtered`, where `φ_target = 0 ns`.
+6. **Compute and protect control voltage** — A PID law converts the filtered error into a voltage offset, followed by output clamping, integral anti-windup, and slew-rate limiting.
+7. **Actuate** — The 12-bit DAC (`PA4`) applies the voltage to the CD4046 VCO, which shifts the frequency toward resonance.
+8. **Repeat** — The capture bank is cleared immediately after the control decision so the next 20 ms window contains only samples taken after that decision.
 
 ### 2.2 The PID Control Law
 
@@ -79,6 +81,14 @@ loop period  ≥  5 · τ
 so that the transducer has effectively settled before the next correction. The default of 20 ms is a safe starting point for typical ultrasonic transducers, but it must be increased for higher-Q loads. The same `dt` value (in seconds) is fed into the integral and derivative terms, which keeps the controller rate-independent: re-scaling the loop period by itself does not change the effective integral/derivative strength, because those terms scale with `dt`.
 
 As a safety measure, `dt` is sanitized inside the controller: values below 1 µs and above 1 s are clamped, so the first call or a corrupted period value cannot produce a huge integral windup spike.
+
+### 2.6 Robust 20 ms Phase Window
+
+At approximately 30–35 kHz, a 1 ms control interval contains roughly 30–35 ZCD cycles and a 20 ms interval contains roughly 600–700 cycles. The firmware processes all available cycles as a measurement window rather than using only the final timestamp. The ISR stores only integer timer values; floating-point filtering and sorting are performed outside the interrupt while the alternate capture bank continues collecting edges.
+
+Block size adapts to the captured sample count, targeting approximately eight chronological blocks per window and clamping each block to 4–32 samples. The confidence policy requires at least 12 samples, at least three accepted blocks, at least 70% accepted samples, no buffer overflow, residual MAD-derived noise no greater than 12 degrees, and no estimated movement greater than 60 degrees within one window. A large inter-window shift must remain consistent for 20 ms of real time, independent of whether the loop runs at 1 ms or 20 ms. These are conservative starting values in `phase_capture.cpp` and should be validated against oscilloscope data from the real transducer and bubble-collapse operating conditions.
+
+The filter cannot recover polarity information that has already been discarded by the external ZCD circuit. If the ZCD emits indistinguishable pulses for both half-cycles, an additional polarity-preserving signal or hardware measurement is required.
 
 ---
 

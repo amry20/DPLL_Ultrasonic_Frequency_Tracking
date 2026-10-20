@@ -443,6 +443,7 @@ void processDPLL()
   uint32_t nowMs = millis();
 
   if (firstRun) {
+    phase_capture::clearWindowData();
     lastDacUpdate = nowMs;
     firstRun = false;
     return;
@@ -453,13 +454,16 @@ void processDPLL()
     return;
   }
 
-  float dt = dpll::getLoopPeriodMs() * 0.001f;
+  // Use the actual elapsed time rather than assuming the scheduler hit the
+  // configured period exactly. This keeps I/D scaling correct under jitter.
+  float dt = static_cast<float>(nowMs - lastDacUpdate) * 0.001f;
   phase_capture::CaptureData data = phase_capture::getData();
-  float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
+  phase_capture::PhaseWindowData window = phase_capture::consumeWindowData();
   const float kLockThr = dpll::getLockThresholdNs();
 
   // Manual override: loop disengaged
   if (dpll::getManualMode()) {
+    phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
   }
@@ -486,12 +490,40 @@ void processDPLL()
         break;
     }
     dpll::tickSignalAbsent(nowMs);
+    phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
   }
 
   // Signal is valid
   dpll::tickSignalAbsent(0); // Signal present
+
+  // The capture ISR collected every REF/ZCD pair during the settling window.
+  // Do not let a noisy, spiking, overflowing, or abruptly shifted window alter
+  // either the DAC or the integrator. A persistent large shift is accepted only
+  // after it is repeated in a second clean window by consumeWindowData().
+  if (!window.trustworthy) {
+    lockHoldCount = 0;
+    if (state == STATE_LOCKED) state = STATE_TRACKING;
+
+    static uint32_t lastFilterLogMs = 0;
+    if (nowMs - lastFilterLogMs >= 500U) {
+      lastFilterLogMs = nowMs;
+      DebugPort.printf("[DPLL FILTER HOLD] N=%u accepted=%u outlier=%.1f%% noise=%.2f deg slope=%.2f deg/ms%s%s\n",
+                       window.sampleCount,
+                       window.acceptedCount,
+                       window.outlierRatio * 100.0f,
+                       window.noiseMadDeg,
+                       window.slopeDegPerMs,
+                       window.largeShift ? " LARGE_SHIFT" : "",
+                       window.overflow ? " OVERFLOW" : "");
+    }
+    phase_capture::clearWindowData();
+    lastDacUpdate = millis();
+    return;
+  }
+
+  const float filteredPhaseNs = window.phaseDiffNs;
 
   // State Transition & Re-acquisition logic
   if (state == STATE_NO_SIGNAL) {
@@ -512,7 +544,7 @@ void processDPLL()
 
   // Run PI controller update
   dpll::enable(true);
-  float newDacV = dpll::update(data.phaseDiffNs, dt);
+  float newDacV = dpll::update(filteredPhaseNs, dt);
   trackCycles++;
 
   // Check if controller is pinned to rails (0.0 V or 3.3 V)
@@ -523,10 +555,12 @@ void processDPLL()
   }
 
   // Anti-Divergence / Rail Recovery
-  // If stuck on rails for 10 cycles (~200ms) or tracking over 150 cycles (~3s) without locking,
-  // reset back to center voltage to recover.
-  constexpr uint32_t kMaxRailCycles = 10;
-  constexpr uint32_t kMaxTrackCycles = 150;
+  // Keep recovery time constant when the loop period changes. At 20 ms these
+  // evaluate to the original 10 and 150 cycles; at 1 ms they become 200 and
+  // 3000 cycles instead of making recovery twenty times too aggressive.
+  const uint32_t loopPeriodMs = dpll::getLoopPeriodMs();
+  const uint32_t kMaxRailCycles = (200U + loopPeriodMs - 1U) / loopPeriodMs;
+  const uint32_t kMaxTrackCycles = (3000U + loopPeriodMs - 1U) / loopPeriodMs;
   if (railClampCount >= kMaxRailCycles || (state == STATE_TRACKING && trackCycles >= kMaxTrackCycles)) {
     DebugPort.printf("[DPLL RECOVERY] %s — resetting to center voltage %.3f V\n",
                      (railClampCount >= kMaxRailCycles) ? "Rail Clamped" : "Track Timeout",
@@ -537,12 +571,13 @@ void processDPLL()
     railClampCount = 0;
     trackCycles = 0;
     lockHoldCount = 0;
+    phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
   }
 
   // Check Lock Condition
-  bool withinLockWindow = (fabsf(data.phaseDiffNs - dpll::getTargetPhase()) <= kLockThr);
+  bool withinLockWindow = (fabsf(filteredPhaseNs - dpll::getTargetPhase()) <= kLockThr);
 
   if (withinLockWindow) {
     lockHoldCount++;
@@ -551,19 +586,20 @@ void processDPLL()
         state = STATE_LOCKED;
         dpll::setLockedCenter(newDacV);
         DebugPort.printf("[DPLL LOCKED] DAC = %.3f V | Freq = %.1f Hz | Phase = %.1f ns\n",
-                         newDacV, data.frequencyHz, data.phaseDiffNs);
+                         newDacV, data.frequencyHz, filteredPhaseNs);
       }
     }
   } else {
     lockHoldCount = 0;
     if (state == STATE_LOCKED) {
       state = STATE_TRACKING;
-      DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns\n", data.phaseDiffNs);
+      DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns\n", filteredPhaseNs);
     } else if (state == STATE_ACQUIRING) {
       state = STATE_TRACKING;
     }
   }
 
+  phase_capture::clearWindowData();
   lastDacUpdate = millis();
 }
 // Parse and execute one full command line (already trimmed).
