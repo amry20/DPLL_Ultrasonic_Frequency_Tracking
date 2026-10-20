@@ -19,3 +19,7 @@
 /* TIM modules are already enabled by default in this core; re-asserted here
  * only for documentation. The phase-capture timers will live on TIM. */
 #define HAL_TIM_MODULE_ENABLED
+
+/* I2C module enable for external EEPROM (24LC16B on PB6/PB7) */
+#define HAL_I2C_MODULE_ENABLED
+

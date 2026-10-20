@@ -3,6 +3,8 @@
 #include "phase_capture.h"
 #include "dpll_controller.h"
 #include "com.h"
+#include "eeprom_24lc16b.h"
+#include "eeprom_config.h"
 #include <HardwareSerial.h>
 extern "C" void SystemClock_Config(void)
 {
@@ -44,7 +46,7 @@ extern "C" void SystemClock_Config(void)
   }
 }
 
-#define HEARTBEAT_LED PA_6
+#define HEARTBEAT_LED PC_13
 void heartbeat();
 void processSerialDebugCommand();
 void processDPLL();
@@ -61,6 +63,16 @@ void setup()
   com::begin();
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
+
+  // Initialize 24LC16B I2C EEPROM on PB6 (SCL) and PB7 (SDA)
+  if (eeprom::begin(PB6, PB7, 400000))
+  {
+    DebugPort.println(F("EEPROM 24LC16B: Initialized and detected on I2C (PB6/PB7)"));
+  }
+  else
+  {
+    DebugPort.println(F("EEPROM 24LC16B: WARNING - Device not responding on I2C (check wiring/pullups)"));
+  }
 
   // DAC control output: PA4, mid-scale (1.65 V) on start.
   dac::begin();
@@ -84,6 +96,16 @@ void setup()
   dpll::setTargetPhase(0.0f);
   dpll::setOutputLimits(0.0f, 3.3f);
   dpll::setMaxSlew(30.0f);
+
+  // Load saved configuration from EEPROM if present and valid
+  if (eeprom_config::loadSavedConfig())
+  {
+    DebugPort.println(F("EEPROM: Saved DPLL configuration loaded and applied."));
+  }
+  else
+  {
+    DebugPort.println(F("EEPROM: Using default DPLL configuration."));
+  }
 }
 
 void loop()
@@ -326,6 +348,28 @@ void commandProccessor()
       case OPCODE_GET_STREAM_PERIOD:
         sendU32(OPCODE_GET_STREAM_PERIOD, dpll::getStreamPeriodMs());
         break;
+      case OPCODE_GET_EEPROM_STATUS:
+      {
+        uint8_t st = eeprom::isConnected() ? 1 : 0;
+        com::sendPacket(OPCODE_GET_EEPROM_STATUS, 0, &st, 1);
+        break;
+      }
+      case OPCODE_SAVE_CONFIG_EEPROM:
+      {
+        bool ok = eeprom_config::saveCurrentConfig();
+        uint8_t st = ok ? 1 : 0;
+        com::sendPacket(OPCODE_SAVE_CONFIG_EEPROM, 0, &st, 1);
+        DebugPort.printf("[EEPROM] Save configuration: %s\n", ok ? "OK" : "FAILED");
+        break;
+      }
+      case OPCODE_LOAD_CONFIG_EEPROM:
+      {
+        bool ok = eeprom_config::loadSavedConfig();
+        uint8_t st = ok ? 1 : 0;
+        com::sendPacket(OPCODE_LOAD_CONFIG_EEPROM, 0, &st, 1);
+        DebugPort.printf("[EEPROM] Load configuration: %s\n", ok ? "OK" : "FAILED");
+        break;
+      }
     }
   }
 }
@@ -413,7 +457,17 @@ void sendMonitorStream()
   status.PhaseError_ns        = data.valid ? data.phaseDiffNs : s_holdPhaseNs;
   status.PhaseStale           = data.valid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
-  status._pad[0] = status._pad[1] = 0;
+
+  static uint32_t s_lastEepromCheck = 0;
+  static uint8_t s_eepromStatus = 0;
+  if (nowMs - s_lastEepromCheck >= 1000U || s_lastEepromCheck == 0)
+  {
+    s_lastEepromCheck = nowMs;
+    s_eepromStatus = eeprom::isConnected() ? 1 : 0;
+  }
+  status.EepromStatus = s_eepromStatus;
+  status._pad = 0;
+
   com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
 }
 void processDPLL()
@@ -627,6 +681,7 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  run           : re-enable control loop"));
     DebugPort.println(F("  loss <0|1|2>  : signal-loss DAC behaviour: 0=freeze 1=center 2=zero"));
     DebugPort.println(F("  timeout <ms>  : lock memory expiry (ms, 0=never). Default 5000"));
+    DebugPort.println(F("  eeprom        : status, test, save, load, read <addr>, write <addr> <val>, dump <addr> [len]"));
   }
   else if (name == "dac")
   {
@@ -763,6 +818,182 @@ void handleDebugCommand(const String &cmd)
       dpll::setLockMemoryTimeoutMs(v);
       DebugPort.printf("Lock memory timeout = %u ms%s\n", v,
                        v == 0 ? " (never expire)" : "");
+    }
+  }
+  else if (name == "eeprom")
+  {
+    int subSp = arg.indexOf(' ');
+    String subCmd = (subSp < 0) ? arg : arg.substring(0, subSp);
+    String subArg = (subSp < 0) ? "" : arg.substring(subSp + 1);
+    subCmd.trim();
+    subArg.trim();
+
+    if (subCmd == "status" || subCmd == "")
+    {
+      bool connected = eeprom::isConnected();
+      DebugPort.printf("EEPROM 24LC16B: %s (Capacity: %u bytes, Page: %u bytes, SCL=PB6, SDA=PB7)\n",
+                       connected ? "Connected (ACK OK)" : "Disconnected / No ACK",
+                       eeprom::CAPACITY_BYTES, eeprom::PAGE_SIZE);
+    }
+    else if (subCmd == "test")
+    {
+      DebugPort.println(F("Running EEPROM self-test (non-destructive)..."));
+      if (eeprom::selfTest())
+      {
+        DebugPort.println(F("EEPROM self-test PASSED!"));
+      }
+      else
+      {
+        DebugPort.println(F("EEPROM self-test FAILED! Check wiring, pull-ups, or address."));
+      }
+    }
+    else if (subCmd == "read")
+    {
+      if (subArg.length() == 0)
+      {
+        DebugPort.println(F("Usage: eeprom read <addr (0-2047)>"));
+      }
+      else
+      {
+        uint16_t addr = (uint16_t)subArg.toInt();
+        if (addr >= eeprom::CAPACITY_BYTES)
+        {
+          DebugPort.println(F("ERR: Address out of range (0-2047)"));
+        }
+        else
+        {
+          bool ok = false;
+          uint8_t val = eeprom::readByte(addr, &ok);
+          if (ok)
+          {
+            DebugPort.printf("EEPROM[0x%04X (%u)] = 0x%02X (%u)\n", addr, addr, val, val);
+          }
+          else
+          {
+            DebugPort.println(F("ERR: I2C read failed"));
+          }
+        }
+      }
+    }
+    else if (subCmd == "write")
+    {
+      int sp2 = subArg.indexOf(' ');
+      if (sp2 < 0)
+      {
+        DebugPort.println(F("Usage: eeprom write <addr (0-2047)> <val (0-255)>"));
+      }
+      else
+      {
+        String sAddr = subArg.substring(0, sp2);
+        String sVal = subArg.substring(sp2 + 1);
+        sAddr.trim();
+        sVal.trim();
+        uint16_t addr = (uint16_t)sAddr.toInt();
+        uint8_t val = (uint8_t)sVal.toInt();
+        if (addr >= eeprom::CAPACITY_BYTES)
+        {
+          DebugPort.println(F("ERR: Address out of range (0-2047)"));
+        }
+        else
+        {
+          if (eeprom::writeByte(addr, val))
+          {
+            DebugPort.printf("EEPROM[0x%04X] written 0x%02X (%u)\n", addr, val, val);
+          }
+          else
+          {
+            DebugPort.println(F("ERR: I2C write failed"));
+          }
+        }
+      }
+    }
+    else if (subCmd == "dump")
+    {
+      uint16_t addr = 0;
+      uint16_t len = 64;
+      int sp2 = subArg.indexOf(' ');
+      if (subArg.length() > 0)
+      {
+        if (sp2 >= 0)
+        {
+          addr = (uint16_t)subArg.substring(0, sp2).toInt();
+          len = (uint16_t)subArg.substring(sp2 + 1).toInt();
+        }
+        else
+        {
+          addr = (uint16_t)subArg.toInt();
+        }
+      }
+      if (addr >= eeprom::CAPACITY_BYTES)
+      {
+        addr = 0;
+      }
+      if (len == 0 || (uint32_t)addr + len > eeprom::CAPACITY_BYTES)
+      {
+        len = eeprom::CAPACITY_BYTES - addr;
+      }
+      if (len > 256)
+      {
+        len = 256;
+      }
+
+      uint8_t buf[16];
+      DebugPort.printf("--- EEPROM Dump: Addr 0x%04X, Len %u ---\n", addr, len);
+      for (uint16_t i = 0; i < len; i += 16)
+      {
+        uint16_t curAddr = addr + i;
+        uint16_t chunk = ((len - i) < 16) ? (len - i) : 16;
+        if (!eeprom::readBuffer(curAddr, buf, chunk))
+        {
+          DebugPort.println(F("ERR: Read error during dump"));
+          break;
+        }
+        DebugPort.printf("0x%04X: ", curAddr);
+        for (uint16_t b = 0; b < 16; ++b)
+        {
+          if (b < chunk)
+          {
+            DebugPort.printf("%02X ", buf[b]);
+          }
+          else
+          {
+            DebugPort.print("   ");
+          }
+        }
+        DebugPort.print(" |");
+        for (uint16_t b = 0; b < chunk; ++b)
+        {
+          char c = (buf[b] >= 32 && buf[b] <= 126) ? (char)buf[b] : '.';
+          DebugPort.print(c);
+        }
+        DebugPort.println("|");
+      }
+    }
+    else if (subCmd == "save")
+    {
+      if (eeprom_config::saveCurrentConfig())
+      {
+        DebugPort.println(F("EEPROM: Configuration successfully saved to 24LC16B!"));
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Failed to save configuration to EEPROM"));
+      }
+    }
+    else if (subCmd == "load")
+    {
+      if (eeprom_config::loadSavedConfig())
+      {
+        DebugPort.println(F("EEPROM: Configuration successfully loaded and applied!"));
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Failed to load configuration from EEPROM (invalid CRC or not found)"));
+      }
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Unknown eeprom subcommand. Use: status, test, save, load, read, write, dump"));
     }
   }
   else

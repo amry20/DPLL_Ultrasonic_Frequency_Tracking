@@ -43,7 +43,8 @@ typedef struct dpllStatusData
     float   DACVoltage_V;          // 4 bytes
     uint8_t LockStatus;            // 1 byte  (0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK)
     uint8_t PhaseStale;            // 1 byte  (0=fresh measurement, 1=ZCD absent, using last valid)
-    uint8_t _pad[2];               // 2 bytes explicit pad → total 16 bytes
+    uint8_t EepromStatus;          // 1 byte  (0=Not detected / error, 1=Connected & OK)
+    uint8_t _pad;                  // 1 byte explicit pad → total 16 bytes
 }__attribute__((packed)) dpllStatusData;
 namespace com
 {
