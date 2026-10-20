@@ -177,6 +177,18 @@ float AD9833 :: GetResolution ( void ) {
 	return (float)refFrequency / 268435456.0f;
 }
 
+void AD9833 :: SetRefClock ( uint32_t referenceFrequency ) {
+	if ( referenceFrequency == 0 ) return;
+	refFrequency = referenceFrequency;
+	// Recalculate and rewrite registers for both frequencies with new reference clock
+	SetFrequency(REG0, frequency0);
+	SetFrequency(REG1, frequency1);
+}
+
+uint32_t AD9833 :: GetRefClock ( void ) {
+	return refFrequency;
+}
+
 // --------------------- PRIVATE FUNCTIONS --------------------------
 
 void AD9833 :: WriteControlRegister ( void ) {

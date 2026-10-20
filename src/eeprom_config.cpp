@@ -8,6 +8,7 @@
 #include "eeprom_24lc16b.h"
 #include "dpll_controller.h"
 #include "dds_ad9833.h"
+#include "dac_output.h"
 #include <string.h>
 #include <math.h>
 
@@ -53,6 +54,7 @@ namespace eeprom_config
         cfg.streamPeriodMs       = dpll::getStreamPeriodMs();
         cfg.signalLossBehavior   = (uint8_t)dpll::getSignalLossBehavior();
         cfg.generatorSource      = (uint8_t)dpll::getGeneratorSource();
+        cfg.ddsMcoClock          = (uint8_t)dds::getMcoClock();
         cfg.ddsCenterFreq        = dpll::getDdsCenterFreq();
         cfg.ddsMinFreq           = dpll::getDdsMinFreq();
         cfg.ddsMaxFreq           = dpll::getDdsMaxFreq();
@@ -110,6 +112,22 @@ namespace eeprom_config
             return false;
         }
 
+        // Apply DDS & generator parameters first if version >= 2
+        if (cfg.version >= 2)
+        {
+            if (cfg.generatorSource <= 1)
+            {
+                dpll::setGeneratorSource((dpll::GeneratorSource)cfg.generatorSource);
+            }
+            dpll::setDdsFreqLimits(cfg.ddsMinFreq, cfg.ddsMaxFreq);
+            dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
+            dpll::setDdsCenterFreq(cfg.ddsCenterFreq);
+            if (cfg.ddsMcoClock < (uint8_t)dds::MCO_CLOCK_COUNT)
+            {
+                dds::setMcoClock((dds::McoClockSelection)cfg.ddsMcoClock);
+            }
+        }
+
         // Apply loaded configuration to DPLL controller
         dpll::begin(cfg.centerVoltage, cfg.kp, cfg.ki, cfg.kd);
         dpll::setTargetPhase(cfg.targetPhase);
@@ -124,18 +142,7 @@ namespace eeprom_config
             dpll::setSignalLossBehavior((dpll::SignalLossBehavior)cfg.signalLossBehavior);
         }
 
-        if (cfg.version >= 2)
-        {
-            dpll::setDdsFreqLimits(cfg.ddsMinFreq, cfg.ddsMaxFreq);
-            dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
-            dpll::setDdsCenterFreq(cfg.ddsCenterFreq);
-            if (cfg.generatorSource <= 1)
-            {
-                dpll::setGeneratorSource((dpll::GeneratorSource)cfg.generatorSource);
-            }
-        }
-
-        // Ensure DDS hardware output frequency matches the center frequency loaded from EEPROM
+        // Ensure DDS output frequency matches the center frequency loaded from EEPROM
         dds::setFrequency((double)dpll::getDdsCenterFreq());
 
         return true;
@@ -171,8 +178,36 @@ namespace eeprom_config
             return false;
         }
 
-        uint8_t zeros[4] = {0, 0, 0, 0};
-        return eeprom::writeBuffer(EEPROM_CONFIG_ADDR, zeros, sizeof(zeros));
+        // Fill entire PackedConfig area with 0xFF (factory unprogrammed state)
+        return eeprom::fill(EEPROM_CONFIG_ADDR, 0xFF, sizeof(PackedConfig));
+    }
+
+    bool resetConfig()
+    {
+        bool ok = eraseConfig();
+
+        // Restore factory baseline configuration to DPLL controller & hardware peripherals
+        dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_DAC);
+        dpll::setDdsFreqLimits(20000.0f, 40000.0f);
+        dpll::setDdsMaxSlew(20000.0f);
+        dpll::setDdsCenterFreq(28000.0f);
+        dds::setMcoClock(dds::MCO_CLOCK_HSE_8MHZ);
+
+        dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
+        dpll::setTargetPhase(0.0f);
+        dpll::setOutputLimits(0.0f, 3.3f);
+        dpll::setMaxSlew(30.0f);
+        dpll::setLoopPeriodMs(20);
+        dpll::setLockThresholdNs(500.0f);
+        dpll::setLockHoldCycles(10);
+        dpll::setLockMemoryTimeoutMs(5000);
+        dpll::setStreamPeriodMs(10);
+        dpll::setSignalLossBehavior(dpll::SIGNAL_LOSS_FREEZE);
+
+        dac::setVoltage(1.65f);
+        dds::setFrequency(28000.0);
+
+        return ok;
     }
 
 } // namespace eeprom_config

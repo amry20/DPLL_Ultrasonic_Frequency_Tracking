@@ -33,7 +33,8 @@ namespace eeprom_config
         uint32_t streamPeriodMs;
         uint8_t  signalLossBehavior;
         uint8_t  generatorSource;       // 0=DAC, 1=DDS
-        uint8_t  _reserved[2];
+        uint8_t  ddsMcoClock;           // McoClockSelection (0=8MHz HSE, 1=4MHz HSE, etc.)
+        uint8_t  _reserved[1];
         float    ddsCenterFreq;        // Hz
         float    ddsMinFreq;           // Hz
         float    ddsMaxFreq;           // Hz
@@ -64,5 +65,12 @@ namespace eeprom_config
      * @return true on success, false otherwise.
      */
     bool eraseConfig();
+
+    /**
+     * @brief Reset EEPROM configuration (wiping stored config with 0xFF)
+     *        and revert the active DPLL controller, DDS, and DAC to default baseline parameters.
+     * @return true on success, false otherwise.
+     */
+    bool resetConfig();
 
 } // namespace eeprom_config

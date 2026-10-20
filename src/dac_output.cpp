@@ -60,11 +60,10 @@ void begin()
     return;
   }
 
-  // 5) Enable the channel and start at mid-scale.
+  // 5) Enable the channel and start with preset raw or mid-scale.
   HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
-  setRaw(kMaxValue / 2U);
-
   s_started = true;
+  setRaw(s_lastRaw ? s_lastRaw : (kMaxValue / 2U));
 }
 
 void setRaw(uint16_t value)
@@ -73,7 +72,9 @@ void setRaw(uint16_t value)
     value = kMaxValue;
   }
   s_lastRaw = value;
-  HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, value);
+  if (s_started) {
+    HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, value);
+  }
 }
 
 void setVoltage(float volts)

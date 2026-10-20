@@ -65,7 +65,7 @@ void setup()
   pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
   digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
 
-  // Initialize 24LC16B I2C EEPROM on PB6 (SCL) and PB7 (SDA)
+  // 1. Initialize 24LC16B I2C EEPROM on PB6 (SCL) and PB7 (SDA)
   if (eeprom::begin(PB6, PB7, 400000))
   {
     DebugPort.println(F("EEPROM 24LC16B: Initialized and detected on I2C (PB6/PB7)"));
@@ -75,49 +75,47 @@ void setup()
     DebugPort.println(F("EEPROM 24LC16B: WARNING - Device not responding on I2C (check wiring/pullups)"));
   }
 
-  // DAC control output: PA4, mid-scale (1.65 V) on start.
-  dac::begin();
-  dac::setVoltage(1.65f);
-
-  // Initialize AD9833 DDS Generator:
-  // PA8 = MCLK (MCO1 hardware clock = HSE 8MHz / 1 = 8.000 MHz)
-  // PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
-  dds::begin(28000.0, SQUARE_WAVE);
-  DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
-                   dds::MCLK_FREQ_HZ, dds::getResolution(), dds::getFrequency());
-
-  // Initialize 32-bit Input Capture on TIM2:
-  // PA0 = Reference input (Rising edge trigger)
-  // PA1 = ZCD feedback input (Rising edge trigger)
-  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING, 1);
-
-  // Initialize DPLL PI controller.
-  // center 1.65 V. POSITIVE gains (polarity now corrected).
-  // Series resonance: below resonance -> current LEADS -> phase negative;
-  //                    above resonance -> current LAGS -> phase positive.
-  //   error = target - phase ; voltage = center + Kp*error
-  //   - phase positive (above res) -> error negative -> voltage DOWN -> freq down
-  //   - phase negative (below res) -> error positive -> voltage UP  -> freq up
-  // Gains are V per nanosecond (Kp) and V/ns per second (Ki).
-  // Start small; the phase slope near resonance is very steep for high-Q.
-  dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
-  dpll::setTargetPhase(0.0f);
-  dpll::setOutputLimits(0.0f, 3.3f);
-  dpll::setMaxSlew(30.0f);
-
-  // Load saved configuration from EEPROM if present and valid
+  // 2. Load configuration from EEPROM first, or establish default parameters
   if (eeprom_config::loadSavedConfig())
   {
     DebugPort.println(F("EEPROM: Saved DPLL configuration loaded and applied."));
   }
   else
   {
+    // Apply baseline default DPLL & DDS parameters
+    dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
+    dpll::setTargetPhase(0.0f);
+    dpll::setOutputLimits(0.0f, 3.3f);
+    dpll::setMaxSlew(30.0f);
+    dpll::setDdsCenterFreq(28000.0f);
+    dds::setMcoClock(dds::MCO_CLOCK_HSE_8MHZ);
     DebugPort.println(F("EEPROM: Using default DPLL configuration."));
   }
 
-  // Explicitly apply the active center frequency (from EEPROM or default) to AD9833 DDS hardware
-  dds::setFrequency((double)dpll::getDdsCenterFreq());
-  DebugPort.printf("AD9833 DDS: Active Center Frequency: %.2f Hz\n", dds::getFrequency());
+  // 3. Initialize hardware peripherals according to the active configuration:
+
+  // DAC control output: PA4, configured with active center voltage (or 1.65 V neutral in DDS mode)
+  dac::begin();
+  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+  {
+    dac::setVoltage(1.65f); // park DAC at neutral mid-scale
+  }
+  else
+  {
+    dac::setVoltage(dpll::getCenterVoltage());
+  }
+
+  // Initialize AD9833 DDS Generator:
+  // Starts directly with configured MCO clock preset and active center frequency (no intermediate jumping)
+  // PA8 = MCLK (MCO1 hardware clock), PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
+  dds::begin((double)dpll::getDdsCenterFreq(), SQUARE_WAVE, dds::getMcoClock());
+  DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %s, %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
+                   dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution(), dds::getFrequency());
+
+  // Initialize 32-bit Input Capture on TIM2:
+  // PA0 = Reference input (Rising edge trigger)
+  // PA1 = ZCD feedback input (Rising edge trigger)
+  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING, 1);
 }
 
 void loop()
@@ -180,7 +178,7 @@ void commandProccessor()
       case OPCODE_GET_VERSION:
       {
         // Null-terminated version string — the DAQ parser reads until '\0'.
-        const char *version = "DPLL v1.1.0";
+        const char *version = "DPLL v2.0.0";
         com::sendPacket(OPCODE_GET_VERSION, 0, (const uint8_t *)version, strlen(version) + 1);
         break;
       }
@@ -382,6 +380,14 @@ void commandProccessor()
         DebugPort.printf("[EEPROM] Load configuration: %s\n", ok ? "OK" : "FAILED");
         break;
       }
+      case OPCODE_RESET_CONFIG_EEPROM:
+      {
+        bool ok = eeprom_config::resetConfig();
+        uint8_t st = ok ? 1 : 0;
+        com::sendPacket(OPCODE_RESET_CONFIG_EEPROM, 0, &st, 1);
+        DebugPort.printf("[EEPROM] Reset configuration: %s\n", ok ? "OK" : "FAILED");
+        break;
+      }
       case OPCODE_SET_GENERATOR_SOURCE:
         if (plen >= 1)
         {
@@ -440,6 +446,23 @@ void commandProccessor()
       case OPCODE_GET_DDS_MANUAL_FREQ:
         sendFloat(OPCODE_GET_DDS_MANUAL_FREQ, dpll::lastFrequency());
         break;
+      case OPCODE_SET_DDS_MCO_CLOCK:
+        if (plen >= 1)
+        {
+          uint8_t clkSel = pl[0];
+          if (dds::setMcoClock((dds::McoClockSelection)clkSel))
+          {
+            DebugPort.printf("[DDS] MCO Clock set to: %s (%u Hz, Res: %.6f Hz)\n",
+                             dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution());
+          }
+        }
+        break;
+      case OPCODE_GET_DDS_MCO_CLOCK:
+      {
+        uint8_t clkSel = (uint8_t)dds::getMcoClock();
+        com::sendPacket(OPCODE_GET_DDS_MCO_CLOCK, 0, &clkSel, 1);
+        break;
+      }
     }
   }
 }
@@ -756,8 +779,9 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  run           : re-enable control loop"));
     DebugPort.println(F("  loss <0|1|2>  : signal-loss DAC behaviour: 0=freeze 1=center 2=zero"));
     DebugPort.println(F("  timeout <ms>  : lock memory expiry (ms, 0=never). Default 5000"));
-    DebugPort.println(F("  eeprom        : status, test, save, load, read <addr>, write <addr> <val>, dump <addr> [len]"));
-    DebugPort.println(F("  dds           : status, freq <Hz>, on, off, wave <sine|triangle|square>"));
+    DebugPort.println(F("  eeprom        : status, test, save, load, reset, read <addr>, write <addr> <val>, dump <addr> [len]"));
+    DebugPort.println(F("  dds           : status, freq <Hz>, clock [idx|preset], on, off, wave <sine|triangle|square>"));
+    DebugPort.println(F("  mco [preset]  : select DDS MCLK clock preset (resolution & stability: 8mhz, 4mhz, 2mhz, 1.6mhz, 16mhz)"));
     DebugPort.println(F("  source <dac|dds> : select generator source (CD4046 VCO vs AD9833 DDS)"));
     DebugPort.println(F("  ddsfreq <hz>  : set DDS center frequency"));
     DebugPort.println(F("  ddsrange <min> <max> : set DDS tracking limits (Hz)"));
@@ -913,6 +937,10 @@ void handleDebugCommand(const String &cmd)
       DebugPort.printf("EEPROM 24LC16B: %s (Capacity: %u bytes, Page: %u bytes, SCL=PB6, SDA=PB7)\n",
                        connected ? "Connected (ACK OK)" : "Disconnected / No ACK",
                        eeprom::CAPACITY_BYTES, eeprom::PAGE_SIZE);
+      bool hasCfg = eeprom_config::hasValidConfig();
+      DebugPort.printf("Config Status : %s\n", hasCfg ? "VALID (Saved in EEPROM)" : "DEFAULT (No valid saved config)");
+      DebugPort.printf("MCO Clock Set : %s (%u Hz, Res: %.6f Hz)\n",
+                       dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution());
     }
     else if (subCmd == "test")
     {
@@ -1070,9 +1098,20 @@ void handleDebugCommand(const String &cmd)
         DebugPort.println(F("ERR: Failed to load configuration from EEPROM (invalid CRC or not found)"));
       }
     }
+    else if (subCmd == "reset" || subCmd == "erase")
+    {
+      if (eeprom_config::resetConfig())
+      {
+        DebugPort.println(F("EEPROM: Configuration reset to factory defaults and memory erased."));
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Failed to reset EEPROM configuration"));
+      }
+    }
     else
     {
-      DebugPort.println(F("ERR: Unknown eeprom subcommand. Use: status, test, save, load, read, write, dump"));
+      DebugPort.println(F("ERR: Unknown eeprom subcommand. Use: status, test, save, load, reset, read, write, dump"));
     }
   }
   else if (name == "dds")
@@ -1095,9 +1134,46 @@ void handleDebugCommand(const String &cmd)
       const char* wfStr = (wf == SQUARE_WAVE) ? "SQUARE WAVE" : (wf == SINE_WAVE) ? "SINE WAVE" : "TRIANGLE WAVE";
       DebugPort.printf("Waveform  : %s\n", wfStr);
       DebugPort.printf("Frequency : %.4f Hz\n", dds::getFrequency());
-      DebugPort.printf("MCLK      : %u Hz (PA8 MCO1 = HSE 8MHz / 1)\n", dds::MCLK_FREQ_HZ);
-      DebugPort.printf("Resolution: %.6f Hz\n", dds::getResolution());
-      DebugPort.println(F("Pins      : FSYNC=PC4, SCK=PA5, MOSI=PA7, MCLK=PA8"));
+      DebugPort.printf("MCLK Clock: %s (%u Hz)\n", dds::getMcoClockName(), dds::getMclkFreq());
+      DebugPort.printf("Resolution: %.6f Hz (Step size)\n", dds::getResolution());
+      DebugPort.println(F("Pins      : FSYNC=PC4, SCK=PA5, MOSI=PA7, MCLK=PA8 (MCO1)"));
+    }
+    else if (subCmd == "clock" || subCmd == "mco")
+    {
+      if (subArg.length() == 0)
+      {
+        DebugPort.println(F("--- AD9833 DDS MCO Clock Presets ---"));
+        DebugPort.println(F("Idx | Clock Source   | MCLK Freq    | Resolution   | Stability / Characteristics"));
+        DebugPort.println(F("----+----------------+--------------+--------------+---------------------------------------------"));
+        for (uint8_t i = 0; i < dds::MCO_CLOCK_COUNT; ++i)
+        {
+          const dds::McoClockInfo &inf = dds::getMcoClockInfo((dds::McoClockSelection)i);
+          bool isAct = (dds::getMcoClock() == (dds::McoClockSelection)i);
+          DebugPort.printf(" %u  | %-14s | %8u Hz | %.6f Hz | %-13s %s\n",
+                           i, inf.name, inf.freqHz, inf.resolutionHz, inf.stability,
+                           isAct ? "[*ACTIVE*]" : "");
+        }
+        DebugPort.printf("Active MCO Clock : %s (%u Hz, Res: %.6f Hz)\n",
+                         dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution());
+        DebugPort.println(F("Usage: dds clock <0-6> or dds clock <8mhz|4mhz|2mhz|1.6mhz|16mhz>"));
+      }
+      else
+      {
+        dds::McoClockSelection sel = dds::parseMcoClock(subArg.c_str());
+        if (sel < dds::MCO_CLOCK_COUNT)
+        {
+          dds::setMcoClock(sel);
+          const dds::McoClockInfo &inf = dds::getMcoClockInfo(sel);
+          DebugPort.printf("DDS MCO Clock set to: %s (%u Hz)\n", inf.name, inf.freqHz);
+          DebugPort.printf("Frequency Resolution: %.6f Hz (Step size)\n", dds::getResolution());
+          DebugPort.printf("Clock Characteristics: %s\n", inf.description);
+          DebugPort.println(F("Hint: Use 'eeprom save' to preserve this clock setting permanently across reboots."));
+        }
+        else
+        {
+          DebugPort.println(F("ERR: Invalid clock preset. Type 'dds clock' to list all available presets."));
+        }
+      }
     }
     else if (subCmd == "freq")
     {
@@ -1154,7 +1230,44 @@ void handleDebugCommand(const String &cmd)
     }
     else
     {
-      DebugPort.println(F("ERR: Unknown dds subcommand. Use: status, freq <Hz>, on, off, wave <sine|triangle|square>"));
+      DebugPort.println(F("ERR: Unknown dds subcommand. Use: status, freq <Hz>, clock [idx|preset], on, off, wave <sine|triangle|square>"));
+    }
+  }
+  else if (name == "mco" || name == "ddsclock")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.println(F("--- AD9833 DDS MCO Clock Presets ---"));
+      DebugPort.println(F("Idx | Clock Source   | MCLK Freq    | Resolution   | Stability / Characteristics"));
+      DebugPort.println(F("----+----------------+--------------+--------------+---------------------------------------------"));
+      for (uint8_t i = 0; i < dds::MCO_CLOCK_COUNT; ++i)
+      {
+        const dds::McoClockInfo &inf = dds::getMcoClockInfo((dds::McoClockSelection)i);
+        bool isAct = (dds::getMcoClock() == (dds::McoClockSelection)i);
+        DebugPort.printf(" %u  | %-14s | %8u Hz | %.6f Hz | %-13s %s\n",
+                         i, inf.name, inf.freqHz, inf.resolutionHz, inf.stability,
+                         isAct ? "[*ACTIVE*]" : "");
+      }
+      DebugPort.printf("Active MCO Clock : %s (%u Hz, Res: %.6f Hz)\n",
+                       dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution());
+      DebugPort.println(F("Usage: mco <0-6> or mco <8mhz|4mhz|2mhz|1.6mhz|16mhz>"));
+    }
+    else
+    {
+      dds::McoClockSelection sel = dds::parseMcoClock(arg.c_str());
+      if (sel < dds::MCO_CLOCK_COUNT)
+      {
+        dds::setMcoClock(sel);
+        const dds::McoClockInfo &inf = dds::getMcoClockInfo(sel);
+        DebugPort.printf("DDS MCO Clock set to: %s (%u Hz)\n", inf.name, inf.freqHz);
+        DebugPort.printf("Frequency Resolution: %.6f Hz (Step size)\n", dds::getResolution());
+        DebugPort.printf("Clock Characteristics: %s\n", inf.description);
+        DebugPort.println(F("Hint: Use 'eeprom save' to preserve this clock setting permanently across reboots."));
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Invalid clock preset. Type 'mco' to list all available presets."));
+      }
     }
   }
   else if (name == "source")

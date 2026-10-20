@@ -100,6 +100,12 @@ public:
 	// Return frequency resolution.
 	float GetResolution ( void );
 
+	// Update reference clock frequency (MCLK) and recalculate active frequency registers
+	void SetRefClock ( uint32_t referenceFrequency );
+
+	// Return active reference clock frequency in Hz
+	uint32_t GetRefClock ( void );
+
 private:
 
 	void 			WriteRegister ( uint16_t dat );

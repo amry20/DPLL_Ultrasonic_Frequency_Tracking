@@ -141,3 +141,26 @@ These constants are initialized in `setup()` via the calls `dpll::begin(1.65f, 0
 | `slew <val>` | `slew 30.0` | Set Slew Rate Limit (V/s) |
 | `loop <val>` | `loop 20.0` | Set Control Loop Period (ms) |
 | `status` | `status` | Read current parameters and state |
+| `dds clock [preset]` | `dds clock 2mhz` | View/set DDS MCO1 MCLK clock preset (0-6 or 8mhz, 4mhz, 2mhz, 1.6mhz, 16mhz) |
+| `mco [preset]` | `mco 1.6mhz` | Shortcut to select DDS MCLK clock preset |
+| `dds status` | `dds status` | View active DDS waveform, frequency, MCLK clock, and step resolution |
+| `eeprom status` | `eeprom status` | View 24LC16B EEPROM connection and stored config validation |
+| `eeprom save` | `eeprom save` | Save all active settings (including MCO clock selection) to 24LC16B EEPROM |
+| `eeprom load` | `eeprom load` | Load configuration from 24LC16B EEPROM and apply to hardware |
+| `eeprom reset` | `eeprom reset` | Erase EEPROM configuration (0xFF) and reset system to factory defaults |
+
+---
+
+## 6. AD9833 DDS MCO Clock Presets (Resolution vs. Stability)
+
+The STM32F407 generates the master clock (`MCLK`) for the AD9833 DDS generator via hardware output pin `PA8` (`MCO1`). The user can select the clock source (Quartz Crystal HSE vs. Internal RC HSI) and prescaler divider to optimize between **frequency step resolution** and **phase jitter / edge speed**:
+
+| Idx | Clock Preset | Source & Division | MCLK Frequency | Step Resolution (Δf = MCLK / 2²⁸) | Jitter / Edge | Stability Characteristics |
+|:---:|---|---|---|---|---|---|
+| **0** | `HSE 8MHz (/1)` | HSE / 1 (Crystal) | 8,000,000 Hz | **0.029802 Hz** (~0.030 Hz) | 125 ns | High stability quartz crystal (~10-20 ppm). Standard default. |
+| **1** | `HSE 4MHz (/2)` | HSE / 2 (Crystal) | 4,000,000 Hz | **0.014901 Hz** (~0.015 Hz) | 250 ns | 2x finer frequency resolution with crystal stability. |
+| **2** | `HSE 2MHz (/4)` | HSE / 4 (Crystal) | 2,000,000 Hz | **0.007451 Hz** (~0.0075 Hz) | 500 ns | Sub-0.01 Hz high resolution with crystal stability. |
+| **3** | `HSE 1.6MHz (/5)`| HSE / 5 (Crystal) | 1,600,000 Hz | **0.005960 Hz** (~0.006 Hz) | 625 ns | Ultra-fine resolution (~6 mHz) with crystal stability. |
+| **4** | `HSI 16MHz (/1)`| HSI / 1 (Internal RC) | 16,000,000 Hz | **0.059605 Hz** (~0.060 Hz) | 62.5 ns | Fastest clock edge (minimum discrete delay), ~1% RC drift. |
+| **5** | `HSI 8MHz (/2)` | HSI / 2 (Internal RC) | 8,000,000 Hz | **0.029802 Hz** (~0.030 Hz) | 125 ns | Standard resolution fallback when external crystal is absent. |
+| **6** | `HSI 4MHz (/4)` | HSI / 4 (Internal RC) | 4,000,000 Hz | **0.014901 Hz** (~0.015 Hz) | 250 ns | High resolution fallback using internal oscillator. |
