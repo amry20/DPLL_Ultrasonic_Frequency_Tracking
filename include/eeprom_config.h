@@ -12,7 +12,7 @@
 namespace eeprom_config
 {
     static constexpr uint32_t CONFIG_MAGIC = 0x44504C31; // "DPL1" in ASCII
-    static constexpr uint16_t CONFIG_VERSION = 1;
+    static constexpr uint16_t CONFIG_VERSION = 2;
     static constexpr uint16_t EEPROM_CONFIG_ADDR = 0x0000;
 
     struct PackedConfig
@@ -32,7 +32,12 @@ namespace eeprom_config
         uint32_t lockMemoryTimeoutMs;
         uint32_t streamPeriodMs;
         uint8_t  signalLossBehavior;
-        uint8_t  _reserved[3];
+        uint8_t  generatorSource;       // 0=DAC, 1=DDS
+        uint8_t  _reserved[2];
+        float    ddsCenterFreq;        // Hz
+        float    ddsMinFreq;           // Hz
+        float    ddsMaxFreq;           // Hz
+        float    ddsMaxSlew;           // Hz/s
         uint32_t crc32;
     } __attribute__((packed));
 

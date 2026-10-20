@@ -7,6 +7,7 @@
 #include "eeprom_config.h"
 #include "eeprom_24lc16b.h"
 #include "dpll_controller.h"
+#include "dds_ad9833.h"
 #include <string.h>
 #include <math.h>
 
@@ -51,6 +52,11 @@ namespace eeprom_config
         cfg.lockMemoryTimeoutMs  = dpll::getLockMemoryTimeoutMs();
         cfg.streamPeriodMs       = dpll::getStreamPeriodMs();
         cfg.signalLossBehavior   = (uint8_t)dpll::getSignalLossBehavior();
+        cfg.generatorSource      = (uint8_t)dpll::getGeneratorSource();
+        cfg.ddsCenterFreq        = dpll::getDdsCenterFreq();
+        cfg.ddsMinFreq           = dpll::getDdsMinFreq();
+        cfg.ddsMaxFreq           = dpll::getDdsMaxFreq();
+        cfg.ddsMaxSlew           = dpll::getDdsMaxSlew();
 
         // Calculate CRC32 over all fields except the crc32 field itself
         size_t crcLen = offsetof(PackedConfig, crc32);
@@ -84,12 +90,12 @@ namespace eeprom_config
             return false;
         }
 
-        if (cfg.magic != CONFIG_MAGIC || cfg.version != CONFIG_VERSION || cfg.length != sizeof(PackedConfig))
+        if (cfg.magic != CONFIG_MAGIC || (cfg.version != 1 && cfg.version != 2))
         {
             return false;
         }
 
-        size_t crcLen = offsetof(PackedConfig, crc32);
+        size_t crcLen = (cfg.version == 2) ? offsetof(PackedConfig, crc32) : 56;
         uint32_t expectedCrc = calcCrc32(reinterpret_cast<const uint8_t *>(&cfg), crcLen);
         if (cfg.crc32 != expectedCrc)
         {
@@ -117,6 +123,20 @@ namespace eeprom_config
         {
             dpll::setSignalLossBehavior((dpll::SignalLossBehavior)cfg.signalLossBehavior);
         }
+
+        if (cfg.version >= 2)
+        {
+            dpll::setDdsFreqLimits(cfg.ddsMinFreq, cfg.ddsMaxFreq);
+            dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
+            dpll::setDdsCenterFreq(cfg.ddsCenterFreq);
+            if (cfg.generatorSource <= 1)
+            {
+                dpll::setGeneratorSource((dpll::GeneratorSource)cfg.generatorSource);
+            }
+        }
+
+        // Ensure DDS hardware output frequency matches the center frequency loaded from EEPROM
+        dds::setFrequency((double)dpll::getDdsCenterFreq());
 
         return true;
     }

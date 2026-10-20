@@ -29,13 +29,35 @@
 
 namespace dpll
 {
+    // Output generator mode
+    enum GeneratorSource : uint8_t {
+        GENERATOR_SOURCE_DAC = 0, // External VCO (CD4046) driven by DAC1 (PA4)
+        GENERATOR_SOURCE_DDS = 1  // Direct DDS (AD9833) frequency modulation via SPI1
+    };
 
     // Initialize the controller.
     // centerVoltage : VCO voltage that produces the nominal/center frequency.
-    // kp            : proportional gain (V per nanosecond of phase error).
-    // ki            : integral gain (V per nanosecond per second).
-    // kd            : derivative gain (V per nanosecond per second).
+    // kp            : proportional gain (V per nanosecond of phase error for DAC, Hz/ns for DDS).
+    // ki            : integral gain (V per nanosecond per second for DAC, Hz/ns/s for DDS).
+    // kd            : derivative gain.
     void begin(float centerVoltage, float kp, float ki, float kd = 0.0f);
+
+    // Generator Source (DAC vs DDS)
+    GeneratorSource getGeneratorSource();
+    void            setGeneratorSource(GeneratorSource src);
+
+    // DDS frequency configuration
+    float getDdsCenterFreq();
+    void  setDdsCenterFreq(float freqHz);
+
+    float getDdsMinFreq();
+    float getDdsMaxFreq();
+    void  setDdsFreqLimits(float minHz, float maxHz);
+
+    float getDdsMaxSlew();
+    void  setDdsMaxSlew(float hzPerSecond);
+
+    float lastFrequency();
 
     // Set the phase delay the loop should lock onto, in nanoseconds (default 0).
     void setTargetPhase(float targetNs);
@@ -78,6 +100,13 @@ namespace dpll
 
     // Disable the loop and force the DAC to a fixed voltage (manual control).
     void manualSet(float voltage);
+
+    // Disable the loop and force the AD9833 DDS to a fixed frequency (manual frequency control).
+    void manualSetFreq(float freqHz);
+
+    // Re-initialize controller for tracking from a specific starting frequency
+    // (bumpless restart in DDS mode).
+    void restartAtFrequency(float startingFreq);
 
     // Current configuration getters (for UART status/tuning).
     float getKp();

@@ -23,3 +23,7 @@
 /* I2C module enable for external EEPROM (24LC16B on PB6/PB7) */
 #define HAL_I2C_MODULE_ENABLED
 
+/* SPI module enable for AD9833 DDS (PC4=SS, PA5=SCK, PA7=MOSI) */
+#define HAL_SPI_MODULE_ENABLED
+
+

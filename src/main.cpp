@@ -5,6 +5,7 @@
 #include "com.h"
 #include "eeprom_24lc16b.h"
 #include "eeprom_config.h"
+#include "dds_ad9833.h"
 #include <HardwareSerial.h>
 extern "C" void SystemClock_Config(void)
 {
@@ -78,6 +79,13 @@ void setup()
   dac::begin();
   dac::setVoltage(1.65f);
 
+  // Initialize AD9833 DDS Generator:
+  // PA8 = MCLK (MCO1 hardware clock = HSE 8MHz / 1 = 8.000 MHz)
+  // PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
+  dds::begin(28000.0, SQUARE_WAVE);
+  DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
+                   dds::MCLK_FREQ_HZ, dds::getResolution(), dds::getFrequency());
+
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising edge trigger)
   // PA1 = ZCD feedback input (Rising edge trigger)
@@ -106,6 +114,10 @@ void setup()
   {
     DebugPort.println(F("EEPROM: Using default DPLL configuration."));
   }
+
+  // Explicitly apply the active center frequency (from EEPROM or default) to AD9833 DDS hardware
+  dds::setFrequency((double)dpll::getDdsCenterFreq());
+  DebugPort.printf("AD9833 DDS: Active Center Frequency: %.2f Hz\n", dds::getFrequency());
 }
 
 void loop()
@@ -370,6 +382,64 @@ void commandProccessor()
         DebugPort.printf("[EEPROM] Load configuration: %s\n", ok ? "OK" : "FAILED");
         break;
       }
+      case OPCODE_SET_GENERATOR_SOURCE:
+        if (plen >= 1)
+        {
+          uint8_t src = pl[0];
+          if (src <= 1)
+          {
+            dpll::setGeneratorSource((dpll::GeneratorSource)src);
+            DebugPort.printf("[DPLL] Generator source set to: %s\n", src == 1 ? "DDS (AD9833)" : "DAC (CD4046)");
+          }
+        }
+        break;
+      case OPCODE_GET_GENERATOR_SOURCE:
+      {
+        uint8_t src = (uint8_t)dpll::getGeneratorSource();
+        com::sendPacket(OPCODE_GET_GENERATOR_SOURCE, 0, &src, 1);
+        break;
+      }
+      case OPCODE_SET_DDS_FREQ_BOUNDS:
+        if (plen >= 8)
+        {
+          float minHz, maxHz;
+          memcpy(&minHz, pl, 4);
+          memcpy(&maxHz, pl + 4, 4);
+          dpll::setDdsFreqLimits(minHz, maxHz);
+          DebugPort.printf("[DPLL] DDS bounds set: %.1f - %.1f Hz\n", minHz, maxHz);
+        }
+        break;
+      case OPCODE_GET_DDS_FREQ_BOUNDS:
+      {
+        float bounds[2] = { dpll::getDdsMinFreq(), dpll::getDdsMaxFreq() };
+        com::sendPacket(OPCODE_GET_DDS_FREQ_BOUNDS, 0, (const uint8_t *)bounds, sizeof(bounds));
+        break;
+      }
+      case OPCODE_SET_DDS_CENTER_FREQ:
+        if (plen >= 4)
+        {
+          dpll::setDdsCenterFreq(payloadFloat());
+          DebugPort.printf("[DPLL] DDS center freq set: %.1f Hz\n", dpll::getDdsCenterFreq());
+        }
+        break;
+      case OPCODE_GET_DDS_CENTER_FREQ:
+        sendFloat(OPCODE_GET_DDS_CENTER_FREQ, dpll::getDdsCenterFreq());
+        break;
+      case OPCODE_SET_DDS_MANUAL_FREQ:
+        if (plen >= 4)
+        {
+          float f = payloadFloat();
+          if (f >= 1.0f && f <= 500000.0f)
+          {
+            dpll::setManualMode(true);
+            dpll::manualSetFreq(f);
+            DebugPort.printf("[DPLL] Manual DDS frequency set: %.2f Hz\n", f);
+          }
+        }
+        break;
+      case OPCODE_GET_DDS_MANUAL_FREQ:
+        sendFloat(OPCODE_GET_DDS_MANUAL_FREQ, dpll::lastFrequency());
+        break;
     }
   }
 }
@@ -466,7 +536,12 @@ void sendMonitorStream()
     s_eepromStatus = eeprom::isConnected() ? 1 : 0;
   }
   status.EepromStatus = s_eepromStatus;
-  status._pad = 0;
+  uint8_t ddsSt = (uint8_t)dds::getStatus(data.refValid ? data.frequencyHz : 0.0f);
+  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+  {
+    ddsSt |= 0x80; // Bit 7 set indicates DDS is active generator source
+  }
+  status.DdsStatus = ddsSt;
 
   com::sendPacket(OPCODE_STREAM_DPLL_STATUS, 0, (uint8_t *)&status, sizeof(status));
 }
@@ -682,6 +757,10 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  loss <0|1|2>  : signal-loss DAC behaviour: 0=freeze 1=center 2=zero"));
     DebugPort.println(F("  timeout <ms>  : lock memory expiry (ms, 0=never). Default 5000"));
     DebugPort.println(F("  eeprom        : status, test, save, load, read <addr>, write <addr> <val>, dump <addr> [len]"));
+    DebugPort.println(F("  dds           : status, freq <Hz>, on, off, wave <sine|triangle|square>"));
+    DebugPort.println(F("  source <dac|dds> : select generator source (CD4046 VCO vs AD9833 DDS)"));
+    DebugPort.println(F("  ddsfreq <hz>  : set DDS center frequency"));
+    DebugPort.println(F("  ddsrange <min> <max> : set DDS tracking limits (Hz)"));
   }
   else if (name == "dac")
   {
@@ -994,6 +1073,145 @@ void handleDebugCommand(const String &cmd)
     else
     {
       DebugPort.println(F("ERR: Unknown eeprom subcommand. Use: status, test, save, load, read, write, dump"));
+    }
+  }
+  else if (name == "dds")
+  {
+    int subSp = arg.indexOf(' ');
+    String subCmd = (subSp < 0) ? arg : arg.substring(0, subSp);
+    String subArg = (subSp < 0) ? "" : arg.substring(subSp + 1);
+    subCmd.trim();
+    subArg.trim();
+
+    if (subCmd == "status" || subCmd == "")
+    {
+      DebugPort.println(F("--- AD9833 DDS Status ---"));
+      dds::DdsStatus st = dds::getStatus();
+      const char* stStr = (st == dds::DDS_STATUS_SIGNAL_OK) ? "SIGNAL VERIFIED ON PA0" :
+                          (st == dds::DDS_STATUS_READY) ? "READY / OK (Clock & SPI Running)" : "ERROR / NOT READY";
+      DebugPort.printf("Hardware  : %s\n", stStr);
+      DebugPort.printf("Output    : %s\n", dds::isEnabled() ? "ENABLED (ACTIVE)" : "DISABLED (MUTED)");
+      WaveformType wf = dds::getWaveform();
+      const char* wfStr = (wf == SQUARE_WAVE) ? "SQUARE WAVE" : (wf == SINE_WAVE) ? "SINE WAVE" : "TRIANGLE WAVE";
+      DebugPort.printf("Waveform  : %s\n", wfStr);
+      DebugPort.printf("Frequency : %.4f Hz\n", dds::getFrequency());
+      DebugPort.printf("MCLK      : %u Hz (PA8 MCO1 = HSE 8MHz / 1)\n", dds::MCLK_FREQ_HZ);
+      DebugPort.printf("Resolution: %.6f Hz\n", dds::getResolution());
+      DebugPort.println(F("Pins      : FSYNC=PC4, SCK=PA5, MOSI=PA7, MCLK=PA8"));
+    }
+    else if (subCmd == "freq")
+    {
+      if (subArg.length() == 0)
+      {
+        DebugPort.printf("DDS Frequency: %.4f Hz\n", dds::getFrequency());
+      }
+      else
+      {
+        double f = strtod(subArg.c_str(), nullptr);
+        if (f >= 1.0 && f <= 500000.0)
+        {
+          dpll::setManualMode(true);
+          dpll::manualSetFreq((float)f);
+          DebugPort.printf("DDS Frequency set to %.4f Hz (manual mode)\n", dds::getFrequency());
+        }
+        else
+        {
+          DebugPort.println(F("ERR: Frequency out of range (1.0 to 500000.0 Hz)"));
+        }
+      }
+    }
+    else if (subCmd == "on")
+    {
+      dds::enableOutput(true);
+      DebugPort.println(F("DDS output ENABLED"));
+    }
+    else if (subCmd == "off")
+    {
+      dds::enableOutput(false);
+      DebugPort.println(F("DDS output DISABLED (MUTED)"));
+    }
+    else if (subCmd == "wave")
+    {
+      if (subArg == "sine")
+      {
+        dds::setWaveform(SINE_WAVE);
+        DebugPort.println(F("DDS Waveform: SINE"));
+      }
+      else if (subArg == "triangle")
+      {
+        dds::setWaveform(TRIANGLE_WAVE);
+        DebugPort.println(F("DDS Waveform: TRIANGLE"));
+      }
+      else if (subArg == "square")
+      {
+        dds::setWaveform(SQUARE_WAVE);
+        DebugPort.println(F("DDS Waveform: SQUARE"));
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Waveform must be sine, triangle, or square"));
+      }
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Unknown dds subcommand. Use: status, freq <Hz>, on, off, wave <sine|triangle|square>"));
+    }
+  }
+  else if (name == "source")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("Generator Source: %s\n",
+                       dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS ? "DDS (AD9833)" : "DAC (CD4046 VCO)");
+    }
+    else if (arg == "dds" || arg == "1")
+    {
+      dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_DDS);
+      DebugPort.println(F("Generator Source set to DDS (AD9833). Ensure physical resistor jumper is set to DDS!"));
+    }
+    else if (arg == "dac" || arg == "0")
+    {
+      dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_DAC);
+      DebugPort.println(F("Generator Source set to DAC (CD4046 VCO)."));
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Invalid source. Use 'dac' or 'dds'."));
+    }
+  }
+  else if (name == "ddsfreq")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("DDS Center Frequency: %.2f Hz\n", dpll::getDdsCenterFreq());
+    }
+    else
+    {
+      float f = arg.toFloat();
+      dpll::setDdsCenterFreq(f);
+      DebugPort.printf("DDS Center Frequency set to: %.2f Hz\n", dpll::getDdsCenterFreq());
+    }
+  }
+  else if (name == "ddsrange")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("DDS Frequency Limits: %.1f - %.1f Hz\n", dpll::getDdsMinFreq(), dpll::getDdsMaxFreq());
+    }
+    else
+    {
+      int sp2 = arg.indexOf(' ');
+      if (sp2 > 0)
+      {
+        float minF = arg.substring(0, sp2).toFloat();
+        float maxF = arg.substring(sp2 + 1).toFloat();
+        dpll::setDdsFreqLimits(minF, maxF);
+        DebugPort.printf("DDS Frequency Limits set to: %.1f - %.1f Hz\n", dpll::getDdsMinFreq(), dpll::getDdsMaxFreq());
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Usage: ddsrange <min_hz> <max_hz>"));
+      }
     }
   }
   else
