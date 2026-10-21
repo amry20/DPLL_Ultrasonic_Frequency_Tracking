@@ -1,0 +1,51 @@
+;==============================================================================
+; DPLL Ultrasonic Frequency Tracking - Virtual COM Port Driver
+; Target Hardware : STM32F407VET6 (USB CDC Virtual COM Port)
+; OS Support      : Windows 10, Windows 11 (x64, ARM64, x86)
+; Driver Base     : Microsoft Inbox usbser.sys (No custom kernel binary needed)
+;==============================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Ports
+ClassGuid   = {4D36E978-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+DriverVer   = 04/21/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = DeviceList, NTamd64, NTarm64, NTx86
+
+; 64-bit AMD/Intel architectures
+[DeviceList.NTamd64]
+%DeviceName% = DriverInstall, USB\VID_0483&PID_5740
+
+; 64-bit ARM architectures
+[DeviceList.NTarm64]
+%DeviceName% = DriverInstall, USB\VID_0483&PID_5740
+
+; 32-bit x86 architectures
+[DeviceList.NTx86]
+%DeviceName% = DriverInstall, USB\VID_0483&PID_5740
+
+;------------------------------------------------------------------------------
+; Installation Section - routes to Windows inbox usbser.sys
+;------------------------------------------------------------------------------
+[DriverInstall.NT]
+Include = usbser.inf
+Needs   = UsbSerial_Install.NT
+
+[DriverInstall.NT.Services]
+Include = usbser.inf
+Needs   = UsbSerial_Install.NT.Services
+
+[DriverInstall.NT.Hw]
+Include = usbser.inf
+Needs   = UsbSerial_Install.NT.Hw
+
+;------------------------------------------------------------------------------
+; Strings Definitions
+;------------------------------------------------------------------------------
+[Strings]
+ManufacturerName = "DPLL Project"
+DeviceName       = "DPLL USB Serial Port"

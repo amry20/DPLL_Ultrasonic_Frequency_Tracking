@@ -3,5 +3,7 @@
     // The global user setting sets it to "disabled" (set by the STM32CubeIDE
     // clangd extension), which breaks autocomplete, hover, and
     // Ctrl+Click -> Go to Definition here.
-    "C_Cpp.intelliSenseEngine": "default"
+    "C_Cpp.intelliSenseEngine": "default",
+    // Disable Python language server since this is an embedded C/C++ project
+    "python.languageServer": "None"
 }
