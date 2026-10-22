@@ -535,7 +535,7 @@ void debugPrint()
     const char *manual = dpll::getManualMode() ? " [MANUAL]" : "";
     if (data.valid)
     {
-      float absPhase = data.phaseDiffNs < 0.0f ? -data.phaseDiffNs : data.phaseDiffNs;
+      float absPhase = fabsf(data.phaseDiffNs - dpll::getTargetPhase());
       const char *state = (absPhase <= dpll::getLockThresholdNs()) ? "LOCK" : "TRACK";
       DebugPort.printf("%s%s | Freq: %.2f Hz | Phase: %.1f ns | Period: %.2f us | DAC: %.2f V\n",
                     state, manual,
@@ -708,6 +708,25 @@ void processDPLL()
   static bool     s_haveStartV = false;
   static bool     s_firstLockPending = false;
   static uint8_t  glitchSkipCount = 0;
+  // Lock-independent protection / park bookkeeping.
+  static float    s_lastGoodPhase = 0.0f; // last window phase accepted into the PI
+  static uint8_t  s_goodCount = 0;        // accepted PI updates in this pulse
+  static float    s_parkV = 0.0f;         // clean end-of-pulse output (any state)
+  static bool     s_haveParkV = false;
+  static bool     s_lockedThisPulse = false;
+  static uint8_t  lockMissCount = 0;
+  // Lock needs a few in-window cycles only; large configured hold values
+  // (EEPROM default 10 = 200 ms) never completed within a 450 ms pulse.
+  constexpr uint32_t kMaxEffectiveHold = 5;
+
+  // Restart / park value: first-lock value of previous pulse, else locked
+  // centre, else clean end-of-pulse value, else the supplied fallback.
+  auto restartValue = [&](float fallbackV) -> float {
+    if (s_haveStartV) return s_pulseStartV;
+    if (dpll::haveLockedCenter()) return dpll::getLockedCenterV();
+    if (s_haveParkV) return s_parkV;
+    return fallbackV;
+  };
 
   uint32_t nowMs = millis();
 
@@ -747,10 +766,17 @@ void processDPLL()
       // Commit a clean locked centre (excludes the pulse-end transient).
       float cleanV;
       if (lockHistPick(cleanV)) {
-        dpll::setLockedCenter(cleanV);
+        s_parkV = cleanV;
+        s_haveParkV = true;
+        if (s_lockedThisPulse) {
+          dpll::setLockedCenter(cleanV);
+        }
       }
       lockHistClear();
     }
+    s_goodCount = 0;
+    lockMissCount = 0;
+    s_lockedThisPulse = false;
     if (nowMs - s_lastLockMs >= 500U) {
       digitalWrite(LOCK_INDICATOR_LED, LOW);
     }
@@ -770,9 +796,9 @@ void processDPLL()
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        if (dpll::haveLockedCenter() || s_haveStartV) {
-          // Park at the cold-start point so the next pulse begins at lock.
-          const float parkV = s_haveStartV ? s_pulseStartV : dpll::getLockedCenterV();
+        if (s_haveStartV || dpll::haveLockedCenter() || s_haveParkV) {
+          // Park at the cold-start point so the next pulse begins near lock.
+          const float parkV = restartValue(0.0f);
           if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
             dpll::restartAtFrequency(parkV);
           } else {
@@ -800,13 +826,11 @@ void processDPLL()
     } else {
       // FREEZE / Resume: start exactly from the locked center point
       if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
-        float resumeF = s_haveStartV ? s_pulseStartV
-                      : (dpll::haveLockedCenter() ? dpll::getLockedCenterV() : dpll::lastFrequency());
+        float resumeF = restartValue(dpll::lastFrequency());
         dpll::restartAtFrequency(resumeF);
         DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", resumeF);
       } else {
-        float resumeV = s_haveStartV ? s_pulseStartV
-                      : (dpll::haveLockedCenter() ? dpll::getLockedCenterV() : dpll::lastVoltage());
+        float resumeV = restartValue(dpll::lastVoltage());
         dpll::restartAtVoltage(resumeV);
         DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", resumeV, data.frequencyHz);
       }
@@ -814,6 +838,9 @@ void processDPLL()
     settleCycles = 0;
     s_firstLockPending = true;
     glitchSkipCount = 0;
+    s_goodCount = 0;
+    lockMissCount = 0;
+    s_lockedThisPulse = false;
     lockHistClear();
     s_dpllState = STATE_TRACKING;
     lockHoldCount = 0;
@@ -871,9 +898,8 @@ void processDPLL()
           }
           lockHoldCount = 0;
         }
-      } else {
-        lockHoldCount = 0;
       }
+      // A skipped window neither counts towards nor resets the lock hold.
       phase_capture::clearWindowData();
       lastDacUpdate = millis();
       return;
@@ -888,11 +914,20 @@ void processDPLL()
   // ZCD at the end of a sonication pulse. Do not let it move the DAC.
   // A persistent step (>= 4 cycles) is accepted as real.
   {
-    const float kGlitchThr = fmaxf(4.0f * kLockThr, 2000.0f);
-    const bool recentlyLocked = (s_dpllState == STATE_LOCKED) || (nowMs - s_lastLockMs < 50U);
-    if (recentlyLocked &&
-        fabsf(filteredPhaseNs - dpll::getTargetPhase()) > kGlitchThr &&
-        glitchSkipCount < 4) {
+    // Independent of lock state: compare with the last accepted window
+    // (or the target while no history exists in this pulse).
+    const bool haveGood = (s_goodCount >= 2);
+    const float kJumpThr = fmaxf(1.5f * kLockThr, 1000.0f);
+    bool glitch = false;
+    if (haveGood) {
+      glitch = fabsf(filteredPhaseNs - s_lastGoodPhase) > kJumpThr;
+    } else {
+      // Pulse start: an untrusted window far from target is the transducer
+      // start-up transient, not a usable error.
+      glitch = usedFallback &&
+               fabsf(filteredPhaseNs - dpll::getTargetPhase()) > fmaxf(4.0f * kLockThr, 2500.0f);
+    }
+    if (glitch && glitchSkipCount < 4) {
       glitchSkipCount++;
       phase_capture::clearWindowData();
       lastDacUpdate = millis();
@@ -905,6 +940,9 @@ void processDPLL()
   dpll::enable(true);
   float controlOutput = dpll::update(filteredPhaseNs, dt);
   trackCycles++;
+  s_lastGoodPhase = filteredPhaseNs;
+  if (s_goodCount < 255) s_goodCount++;
+  lockHistPush(nowMs, controlOutput); // clean-output history, any state
 
   // Check if controller is pinned to rails:
   // In DAC mode: check 0.05 V - 3.25 V
@@ -961,17 +999,18 @@ void processDPLL()
       }
     } else {
       unlockHoldCount = 0;
-      if (!usedFallback) {
-        lockHistPush(nowMs, controlOutput);
-      }
     }
   } else {
     // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold
     unlockHoldCount = 0;
     if (withinLockWindow) {
+      lockMissCount = 0;
       lockHoldCount++;
-      if (lockHoldCount >= dpll::getLockHoldCycles()) {
+      const uint32_t holdNeed = dpll::getLockHoldCycles() < kMaxEffectiveHold
+                              ? dpll::getLockHoldCycles() : kMaxEffectiveHold;
+      if (lockHoldCount >= holdNeed) {
         s_dpllState = STATE_LOCKED;
+        s_lockedThisPulse = true;
         if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
           DebugPort.printf("[DPLL LOCKED] Freq = %.1f Hz | Phase = %.1f ns\n",
                            controlOutput, filteredPhaseNs);
@@ -980,7 +1019,6 @@ void processDPLL()
                            controlOutput, data.frequencyHz, filteredPhaseNs);
         }
         dpll::setLockedCenter(controlOutput);
-        lockHistPush(nowMs, controlOutput);
         if (s_firstLockPending) {
           s_pulseStartV = controlOutput;
           s_haveStartV = true;
@@ -988,7 +1026,24 @@ void processDPLL()
         }
       }
     } else {
-      lockHoldCount = 0;
+      // Tolerate one isolated out-of-window cycle.
+      if (++lockMissCount >= 2) {
+        lockHoldCount = 0;
+        lockMissCount = 0;
+      }
+    }
+  }
+
+  {
+    static uint32_t lastDiagMs = 0;
+    if (nowMs - lastDiagMs >= 500U) {
+      lastDiagMs = nowMs;
+      DebugPort.printf("[DPLL DIAG] win=%.0f ns tgt=%.0f thr=%.0f hold=%u/%u(cfg %u) %s%s\n",
+                       filteredPhaseNs, dpll::getTargetPhase(), kLockThr,
+                       (unsigned)lockHoldCount, (unsigned)kMaxEffectiveHold,
+                       (unsigned)dpll::getLockHoldCycles(),
+                       s_dpllState == STATE_LOCKED ? "LOCKED" : "TRACK",
+                       usedFallback ? " fallback" : "");
     }
   }
 
