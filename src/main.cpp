@@ -776,12 +776,27 @@ void processDPLL()
     if (wasActive) {
       // Commit a clean locked centre (excludes the pulse-end transient).
       float cleanV;
-      if (lockHistPick(cleanV)) {
-        s_parkV = cleanV;
-        s_haveParkV = true;
-        if (s_lockedThisPulse) {
-          dpll::setLockedCenter(cleanV);
+      if (s_lockedThisPulse && lockHistPick(cleanV)) {
+        bool isSane = false;
+        if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+          isSane = (fabsf(cleanV - dpll::getDdsCenterFreq()) <= 1500.0f);
+        } else {
+          isSane = (cleanV >= 1.50f && fabsf(cleanV - dpll::getCenterVoltage()) <= 0.22f);
         }
+
+        if (isSane) {
+          s_parkV = cleanV;
+          s_haveParkV = true;
+          dpll::setLockedCenter(cleanV);
+        } else {
+          s_haveParkV = false;
+          dpll::clearLockedCenter();
+        }
+      } else if (!s_lockedThisPulse) {
+        // If the pulse ended without a valid lock, discard previous park value
+        // and reset locked center to avoid dragging bad tracking into next pulse.
+        s_haveParkV = false;
+        dpll::clearLockedCenter();
       }
       lockHistClear();
     }
@@ -807,9 +822,9 @@ void processDPLL()
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        if (s_haveStartV || dpll::haveLockedCenter() || s_haveParkV) {
-          // Park at the cold-start point so the next pulse begins near lock.
-          const float parkV = restartValue(0.0f);
+        if (dpll::haveLockedCenter() || s_haveParkV) {
+          // Park at the confirmed operating point near resonance.
+          const float parkV = restartValue(dpll::getCenterVoltage());
           if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
             dpll::restartAtFrequency(parkV);
           } else {
@@ -847,7 +862,6 @@ void processDPLL()
       }
     }
     settleCycles = 0;
-    s_firstLockPending = true;
     glitchSkipCount = 0;
     s_goodCount = 0;
     lockMissCount = 0;
@@ -862,7 +876,9 @@ void processDPLL()
   }
 
   // Ignore the start-up transient windows of each pulse (no PID update).
-  if (settleCycles < 2) {
+  // 3 windows = 30 ms, allowing mechanical ring-up under swab/viscous loading
+  // to settle before active PI steering.
+  if (settleCycles < 3) {
     settleCycles++;
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
@@ -953,7 +969,9 @@ void processDPLL()
   trackCycles++;
   s_lastGoodPhase = filteredPhaseNs;
   if (s_goodCount < 255) s_goodCount++;
-  lockHistPush(nowMs, controlOutput); // clean-output history, any state
+  if (s_dpllState == STATE_LOCKED && !usedFallback) {
+    lockHistPush(nowMs, controlOutput); // Only record verified locked operating points
+  }
 
   // Check if controller is pinned to rails:
   // In DAC mode: check 0.05 V - 3.25 V
@@ -992,7 +1010,7 @@ void processDPLL()
 
   // Check Lock Condition with hysteresis / debounce
   const float phaseErr = fabsf(filteredPhaseNs - dpll::getTargetPhase());
-  const bool withinLockWindow = (phaseErr <= kLockThr);
+  const bool withinLockWindow = (phaseErr <= kLockThr) && !usedFallback;
 
   if (s_dpllState == STATE_LOCKED) {
     // Already LOCKED: require 3 consecutive cycles outside threshold before dropping lock.
@@ -1012,13 +1030,14 @@ void processDPLL()
       unlockHoldCount = 0;
     }
   } else {
-    // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold
+    // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold (minimum 3 cycles)
     unlockHoldCount = 0;
     if (withinLockWindow) {
       lockMissCount = 0;
       lockHoldCount++;
-      const uint32_t holdNeed = dpll::getLockHoldCycles() < kMaxEffectiveHold
-                              ? dpll::getLockHoldCycles() : kMaxEffectiveHold;
+      const uint32_t configuredHold = dpll::getLockHoldCycles();
+      const uint32_t holdNeed = (configuredHold < 3) ? 3 :
+                              (configuredHold > kMaxEffectiveHold ? kMaxEffectiveHold : configuredHold);
       if (lockHoldCount >= holdNeed) {
         s_dpllState = STATE_LOCKED;
         s_lockedThisPulse = true;
@@ -1030,11 +1049,6 @@ void processDPLL()
                            controlOutput, data.frequencyHz, filteredPhaseNs);
         }
         dpll::setLockedCenter(controlOutput);
-        if (s_firstLockPending) {
-          s_pulseStartV = controlOutput;
-          s_haveStartV = true;
-          s_firstLockPending = false;
-        }
       }
     } else {
       // Tolerate one isolated out-of-window cycle.
