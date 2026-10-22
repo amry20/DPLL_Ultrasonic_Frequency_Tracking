@@ -35,11 +35,15 @@ volatile bool     s_refValid       = false;
 uint32_t s_zcdTimeoutMs = 50;
 uint32_t s_refTimeoutMs = 100;
 
-// A ZCD edge older than this many REF periods means the ZCD signal is gone
-// (pulse ended). Without this check the millisecond timeout kept `valid` true
-// for tens of ms after the last ZCD edge, and the stale ZCD timestamp was
-// paired with fresh REF edges -> random phase in +-period/2.
-constexpr uint32_t kZcdMaxAgePeriods = 64; // ~1.9 ms at 33.5 kHz
+// Maximum allowed age of the last ZCD edge before declaring ZCD absent.
+// At ~33.5 kHz, 1 period is ~29.8 us. 6 periods = ~179 us (< 0.2 ms).
+// If 6 consecutive cycles have no ZCD edge, the pulse has ended or signal is lost.
+constexpr uint32_t kZcdMaxAgePeriods = 6;
+
+static float    s_stableRefFreqHz = 0.0f;
+static uint32_t s_stableRefMs     = 0;
+constexpr float kPulseEndFreqJumpHz = 200.0f;
+constexpr uint32_t kStableRefFreshMs = 80U;
 
 constexpr float kTimerClockHz = 84000000.0f; // 84 MHz APB1 timer clock on STM32F407
 
@@ -319,10 +323,28 @@ CaptureData getData()
   // Frequency in Hz
   out.frequencyHz = kTimerClockHz / static_cast<float>(out.periodTicks);
 
+  // Pulse-end detection: if REF frequency abruptly jumps while ZCD is present,
+  // the generator has switched to its idle frequency (+500 Hz jump) at the end of a pulse.
+  // Both the DPLL control loop and monitor stream must immediately treat this as signal loss.
+  if (out.zcdPresent) {
+    const bool stableFresh = (s_stableRefMs != 0U) && ((now - s_stableRefMs) <= kStableRefFreshMs);
+    if (stableFresh && fabsf(out.frequencyHz - s_stableRefFreqHz) > kPulseEndFreqJumpHz) {
+      out.zcdPresent = false;
+      out.valid      = false;
+    } else {
+      s_stableRefFreqHz = stableFresh ? (0.8f * s_stableRefFreqHz + 0.2f * out.frequencyHz)
+                                      : out.frequencyHz;
+      s_stableRefMs     = now;
+    }
+  } else {
+    s_stableRefMs = 0; // Clear tracking when ZCD is absent
+  }
+
   if (!out.zcdPresent) {
     // ZCD not present/too old -> phase diff invalid
     out.phaseDiffTicks = 0;
     out.phaseDiffNs    = 0.0f;
+    out.valid          = false;
     return out;
   }
 
@@ -610,6 +632,8 @@ void resetFilterState()
   s_haveShiftCandidate = false;
   s_shiftCandidateSinceMs = 0;
   s_lastTrustedPhaseDeg = 0.0f;
+  s_stableRefMs = 0;
+  s_stableRefFreqHz = 0.0f;
 }
 
 float ticksToUs(uint32_t ticks)

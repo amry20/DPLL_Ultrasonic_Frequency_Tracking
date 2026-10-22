@@ -586,36 +586,10 @@ void sendMonitorStream()
   // Phase value reported while ZCD/REF is absent. Refreshed ONLY on the first
   // valid measurement after a missing period, so the held value reflects the
   // true phase at the current (off-resonance) frequency — not the stale lock
-  // value from before the signal was lost (which misled operators into
-  // thinking the loop was still near resonance).
+  // value from before the signal was lost.
   static bool s_haveValid = false;
   static float s_holdPhaseNs = 0.0f;
-
-  // Pulse-end guard: when the generator stops sonicating, its output (REF) jumps
-  // to the idle frequency (~+500 Hz) while the ZCD edges are still within the
-  // freshness window (or ringing down). The phase of those 1-2 rows is
-  // meaningless. Reject any row whose REF frequency jumps away from the
-  // recently accepted frequency; treat it as the end of the pulse.
-  static float    s_goodFreqHz = 0.0f;
-  static float    s_goodPhaseNs = 0.0f;
-  static uint32_t s_goodMs = 0;
-  constexpr float    kFreqJumpHz   = 250.0f;
-  constexpr uint32_t kGoodFreshMs  = 100U;
-  bool pulseEndJump = false;
   if (data.valid) {
-    const bool goodFresh = (s_goodMs != 0U) && ((nowMs - s_goodMs) <= kGoodFreshMs);
-    if (goodFresh && fabsf(data.frequencyHz - s_goodFreqHz) > kFreqJumpHz) {
-      pulseEndJump = true; // keep s_goodMs so the whole jumped tail stays rejected
-    } else {
-      s_goodFreqHz  = goodFresh ? (0.8f * s_goodFreqHz + 0.2f * data.frequencyHz)
-                                : data.frequencyHz;
-      s_goodPhaseNs = data.phaseDiffNs;
-      s_goodMs      = nowMs;
-    }
-  }
-  const bool phaseOk = data.valid && !pulseEndJump;
-
-  if (phaseOk) {
     if (!s_haveValid) {
       s_holdPhaseNs = data.phaseDiffNs; // first measurement after absence
     }
@@ -628,16 +602,15 @@ void sendMonitorStream()
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
   if (dpll::getManualMode())             status.LockStatus = 4;
   else if (!data.refValid)               status.LockStatus = 0;
-  else if (!data.zcdPresent || pulseEndJump) status.LockStatus = 1;
+  else if (!data.zcdPresent)             status.LockStatus = 1;
   else if (s_dpllState == STATE_LOCKED)  status.LockStatus = 3;
   else                                   status.LockStatus = 2;
   status.ReferenceFrequencyHz = data.frequencyHz;
   // While ZCD/REF is absent: send the phase captured at the first measurement
   // after re-acquire (off-resonance value), not the pre-loss lock value.
   // PhaseStale=1 tells host this is a held value, not a fresh measurement.
-  status.PhaseError_ns        = phaseOk ? data.phaseDiffNs
-                                        : (pulseEndJump ? s_goodPhaseNs : s_holdPhaseNs);
-  status.PhaseStale           = phaseOk ? 0 : 1;
+  status.PhaseError_ns        = data.valid ? data.phaseDiffNs : s_holdPhaseNs;
+  status.PhaseStale           = data.valid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
 
   static uint32_t s_lastEepromCheck = 0;
