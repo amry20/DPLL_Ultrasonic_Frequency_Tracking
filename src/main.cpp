@@ -567,6 +567,7 @@ enum DpllState : uint8_t {
   STATE_LOCKED
 };
 static DpllState s_dpllState = STATE_NO_SIGNAL;
+static phase_capture::CaptureData s_latestCaptureData{};
 
 // Fixed-rate monitor stream — runs independently of the settling window.
 // Rate is set by dpll::getStreamPeriodMs() (default 100 ms = 10 Hz).
@@ -580,37 +581,38 @@ void sendMonitorStream()
   if (nowMs - lastStream < dpll::getStreamPeriodMs()) return;
   lastStream = nowMs;
 
-  phase_capture::CaptureData data = phase_capture::getData();
+  phase_capture::CaptureData data = s_latestCaptureData;
+  if (data.periodTicks == 0U) {
+    data = phase_capture::getData();
+  }
   float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
 
-  // Phase value reported while ZCD/REF is absent. Refreshed ONLY on the first
-  // valid measurement after a missing period, so the held value reflects the
-  // true phase at the current (off-resonance) frequency — not the stale lock
-  // value from before the signal was lost.
-  static bool s_haveValid = false;
+  const bool isSignalActive = (s_dpllState != STATE_NO_SIGNAL);
+  const bool isPhaseValid   = isSignalActive && data.valid;
+
+  // Phase value reported while ZCD/REF is absent.
+  // Updated ONLY while signal is actively being tracked or locked.
   static float s_holdPhaseNs = 0.0f;
-  if (data.valid) {
-    if (!s_haveValid) {
-      s_holdPhaseNs = data.phaseDiffNs; // first measurement after absence
-    }
-    s_haveValid = true;
-  } else {
-    s_haveValid = false;
+  if (isPhaseValid) {
+    s_holdPhaseNs = data.phaseDiffNs;
   }
 
   dpllStatusData status;
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
-  if (dpll::getManualMode())             status.LockStatus = 4;
-  else if (!data.refValid)               status.LockStatus = 0;
-  else if (!data.zcdPresent)             status.LockStatus = 1;
-  else if (s_dpllState == STATE_LOCKED)  status.LockStatus = 3;
-  else                                   status.LockStatus = 2;
+  if (dpll::getManualMode()) {
+    status.LockStatus = 4;
+  } else if (!data.refValid) {
+    status.LockStatus = 0;
+  } else if (!isSignalActive || !data.zcdPresent) {
+    status.LockStatus = 1;
+  } else if (s_dpllState == STATE_LOCKED) {
+    status.LockStatus = 3;
+  } else {
+    status.LockStatus = 2;
+  }
   status.ReferenceFrequencyHz = data.frequencyHz;
-  // While ZCD/REF is absent: send the phase captured at the first measurement
-  // after re-acquire (off-resonance value), not the pre-loss lock value.
-  // PhaseStale=1 tells host this is a held value, not a fresh measurement.
-  status.PhaseError_ns        = data.valid ? data.phaseDiffNs : s_holdPhaseNs;
-  status.PhaseStale           = data.valid ? 0 : 1;
+  status.PhaseError_ns        = isPhaseValid ? data.phaseDiffNs : s_holdPhaseNs;
+  status.PhaseStale           = isPhaseValid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
 
   static uint32_t s_lastEepromCheck = 0;
@@ -745,6 +747,7 @@ void processDPLL()
   // configured period exactly. This keeps I/D scaling correct under jitter.
   float dt = static_cast<float>(nowMs - lastDacUpdate) * 0.001f;
   phase_capture::CaptureData data = phase_capture::getData();
+  s_latestCaptureData = data;
   phase_capture::PhaseWindowData window = phase_capture::consumeWindowData();
   const float kLockThr = dpll::getLockThresholdNs();
 

@@ -43,7 +43,7 @@ constexpr uint32_t kZcdMaxAgePeriods = 6;
 static float    s_stableRefFreqHz = 0.0f;
 static uint32_t s_stableRefMs     = 0;
 constexpr float kPulseEndFreqJumpHz = 200.0f;
-constexpr uint32_t kStableRefFreshMs = 80U;
+constexpr uint32_t kStableRefFreshMs = 200U;
 
 constexpr float kTimerClockHz = 84000000.0f; // 84 MHz APB1 timer clock on STM32F407
 
@@ -331,13 +331,13 @@ CaptureData getData()
     if (stableFresh && fabsf(out.frequencyHz - s_stableRefFreqHz) > kPulseEndFreqJumpHz) {
       out.zcdPresent = false;
       out.valid      = false;
+      out.phaseDiffTicks = 0;
+      out.phaseDiffNs    = 0.0f;
     } else {
       s_stableRefFreqHz = stableFresh ? (0.8f * s_stableRefFreqHz + 0.2f * out.frequencyHz)
                                       : out.frequencyHz;
       s_stableRefMs     = now;
     }
-  } else {
-    s_stableRefMs = 0; // Clear tracking when ZCD is absent
   }
 
   if (!out.zcdPresent) {
@@ -632,8 +632,6 @@ void resetFilterState()
   s_haveShiftCandidate = false;
   s_shiftCandidateSinceMs = 0;
   s_lastTrustedPhaseDeg = 0.0f;
-  s_stableRefMs = 0;
-  s_stableRefFreqHz = 0.0f;
 }
 
 float ticksToUs(uint32_t ticks)
