@@ -341,6 +341,20 @@ float update(float phaseErrorNs, float dtSeconds)
     s_outputFreq += deltaInt;
     float targetFreq = s_outputFreq + deltaProp + derivative;
 
+    // Anti-stall guard (DDS mode):
+    // If operating below resonance frequency and measured phase is in capacitive dead zone,
+    // prevent downward positive feedback runaway by steering frequency back toward center.
+    if ((phaseErrorNs > (s_targetPhaseNs + 800.0f)) &&
+        (s_outputFreq < (s_ddsCenterFreq - 300.0f))) {
+      const float recoveryStep = s_ddsMaxSlew * 0.5f * dtSeconds;
+      s_outputFreq += recoveryStep;
+      if (s_outputFreq > s_ddsCenterFreq) {
+        s_outputFreq = s_ddsCenterFreq;
+      }
+      targetFreq = s_outputFreq;
+      s_haveLastError = false;
+    }
+
     // Clamp output within frequency bounds [min, max] with anti-windup
     if (targetFreq > s_ddsMaxFreq) {
       targetFreq = s_ddsMaxFreq;
@@ -378,6 +392,23 @@ float update(float phaseErrorNs, float dtSeconds)
 
     s_outputVoltage += deltaInt;
     float targetV = s_outputVoltage + deltaProp + derivative;
+
+    // Anti-stall guard (DAC mode):
+    // When DAC drops below resonance (< center - 0.12 V) and the transducer slips
+    // into the capacitive dead zone (phase >> target, e.g. > target + 800 ns),
+    // the system experiences phase slope reversal (dPhase/dDAC < 0).
+    // The negative error would normally drive the DAC into the bottom rail.
+    // Detect this condition and steer voltage back up towards center to re-acquire resonance.
+    if ((phaseErrorNs > (s_targetPhaseNs + 800.0f)) &&
+        (s_outputVoltage < (s_centerVoltage - 0.12f))) {
+      const float recoveryStep = s_maxSlew * 0.5f * dtSeconds;
+      s_outputVoltage += recoveryStep;
+      if (s_outputVoltage > s_centerVoltage) {
+        s_outputVoltage = s_centerVoltage;
+      }
+      targetV = s_outputVoltage;
+      s_haveLastError = false;
+    }
 
     // Clamp output with anti-windup
     if (targetV > s_maxVoltage) {
@@ -469,7 +500,7 @@ void     setLockedCenter(float v)   {
   s_haveLockedCenter = true;
   s_signalWasAbsent  = false;
 }
-void     clearLockedCenter()        { s_haveLockedCenter = false; s_lockedCenterV = 1.65f; }
+void     clearLockedCenter()        { s_haveLockedCenter = false; s_lockedCenterV = s_centerVoltage; }
 
 uint32_t getLockHoldCycles()        { return s_lockHoldCycles; }
 void     setLockHoldCycles(uint32_t v){ if (v >= 1) s_lockHoldCycles = v; }

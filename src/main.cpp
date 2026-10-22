@@ -662,10 +662,10 @@ void lockHistPush(uint32_t ms, float v)
 }
 
 // Pick newest entry that is >= guard older than the newest one; fall back to
-// the oldest stored entry. Returns false when the history is empty.
+// the oldest stored entry. Requires at least 3 samples to avoid single-cycle glitches.
 bool lockHistPick(float &v)
 {
-  if (s_lockHistCount == 0) return false;
+  if (s_lockHistCount < 3) return false;
   const uint8_t newestIdx = (uint8_t)((s_lockHistHead + kLockHistSize - 1) % kLockHistSize);
   const uint32_t newestMs = s_lockHist[newestIdx].ms;
   uint8_t idx = newestIdx;
@@ -698,21 +698,14 @@ void processDPLL()
   static uint32_t railClampCount = 0;
   static uint32_t trackCycles = 0;
   static uint32_t s_lastLockMs = 0;
-  // Number of windows to ignore right after a pulse starts. The first window
-  // after power-up contains the transducer start-up transient (phase swings up
-  // to +-90 deg), which kicked the DAC in a random direction.
+  // Number of windows to ignore right after a pulse starts. Allows acoustic
+  // ring-up under viscous / swab loading to settle before active PI steering.
   static uint32_t settleCycles = 0;
-  // Output value (V or Hz) at the first lock of the previous pulse. The
-  // transducer is cold at pulse start, so this is the best restart point
-  // (end-of-pulse value is ~12 mV warmer).
-  static float    s_pulseStartV = 0.0f;
-  static bool     s_haveStartV = false;
-  static bool     s_firstLockPending = false;
   static uint8_t  glitchSkipCount = 0;
   // Lock-independent protection / park bookkeeping.
   static float    s_lastGoodPhase = 0.0f; // last window phase accepted into the PI
   static uint8_t  s_goodCount = 0;        // accepted PI updates in this pulse
-  static float    s_parkV = 0.0f;         // clean end-of-pulse output (any state)
+  static float    s_parkV = 0.0f;         // clean end-of-pulse locked output
   static bool     s_haveParkV = false;
   static bool     s_lockedThisPulse = false;
   static uint8_t  lockMissCount = 0;
@@ -720,13 +713,29 @@ void processDPLL()
   // (EEPROM default 10 = 200 ms) never completed within a 450 ms pulse.
   constexpr uint32_t kMaxEffectiveHold = 5;
 
-  // Restart / park value: first-lock value of previous pulse, else locked
-  // centre, else clean end-of-pulse value, else the supplied fallback.
+  // Restart / park value: clean steady locked centre, else clean end-of-pulse
+  // value, else the supplied fallback. All candidate values are bounded by a
+  // strict sanity check against calibrated center to prevent false-lock traps.
   auto restartValue = [&](float fallbackV) -> float {
-    if (s_haveStartV) return s_pulseStartV;
-    if (dpll::haveLockedCenter()) return dpll::getLockedCenterV();
-    if (s_haveParkV) return s_parkV;
-    return fallbackV;
+    float candidate = fallbackV;
+    if (dpll::haveLockedCenter()) {
+      candidate = dpll::getLockedCenterV();
+    } else if (s_haveParkV) {
+      candidate = s_parkV;
+    }
+
+    if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+      const float centerF = dpll::getDdsCenterFreq();
+      if (candidate <= 0.0f || fabsf(candidate - centerF) > 1500.0f) {
+        return centerF;
+      }
+    } else {
+      const float centerV = dpll::getCenterVoltage();
+      if (candidate < 1.50f || fabsf(candidate - centerV) > 0.22f) {
+        return centerV;
+      }
+    }
+    return candidate;
   };
 
   uint32_t nowMs = millis();
