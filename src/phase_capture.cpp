@@ -131,6 +131,7 @@ void storePhaseSampleFromIsr(uint32_t zcdCapture)
   int32_t diff = static_cast<int32_t>(zcdCapture - s_lastRefCapture);
   const int32_t period = static_cast<int32_t>(s_periodTicks);
   const int32_t halfPeriod = period / 2;
+
   while (diff > halfPeriod) diff -= period;
   while (diff < -halfPeriod) diff += period;
 
@@ -243,6 +244,8 @@ void setRefTimeout(uint32_t timeoutMs)
 void setRefEdge(EdgePolarity edge)
 {
   s_refEdge = edge;
+  s_refValid = false;
+  s_captureCount = 0;
   if (s_timer) {
     s_timer->setMode(1, toTimerMode(s_refEdge), s_refPin);
   }
@@ -254,6 +257,16 @@ void setZcdEdge(EdgePolarity edge)
   if (s_timer) {
     s_timer->setMode(2, toTimerMode(s_zcdEdge), s_zcdPin);
   }
+}
+
+EdgePolarity getRefEdge()
+{
+  return s_refEdge;
+}
+
+EdgePolarity getZcdEdge()
+{
+  return s_zcdEdge;
 }
 
 CaptureData getData()
@@ -301,9 +314,8 @@ CaptureData getData()
 
   // 1) Raw time difference: ZCD timestamp relative to REF timestamp
   int32_t diff = static_cast<int32_t>(out.zcdTimestamp - out.refTimestamp);
-
-  // 2) Wrap difference to range [-periodTicks/2 .. +periodTicks/2]
   int32_t halfPeriod = static_cast<int32_t>(out.periodTicks / 2);
+  // 3) Wrap difference to range [-periodTicks/2 .. +periodTicks/2]
   while (diff > halfPeriod) {
     diff -= static_cast<int32_t>(out.periodTicks);
   }
@@ -521,6 +533,7 @@ PhaseWindowData consumeWindowData()
                                    static_cast<float>(sampleCount);
   const float periodNs = averagePeriodTicks * (1.0e9f / kTimerClockHz);
   result.phaseDiffNs = (endpointDeg / 360.0f) * periodNs;
+  result.phaseComputed = true;
 
   bool locallyTrustworthy = !overflow &&
       sampleCount >= kMinWindowSamples &&
@@ -575,6 +588,14 @@ void clearWindowData()
   s_bankCount[bank] = 0;
   s_bankOverflow[bank] = false;
   interrupts();
+}
+
+void resetFilterState()
+{
+  s_haveTrustedWindow = false;
+  s_haveShiftCandidate = false;
+  s_shiftCandidateSinceMs = 0;
+  s_lastTrustedPhaseDeg = 0.0f;
 }
 
 float ticksToUs(uint32_t ticks)

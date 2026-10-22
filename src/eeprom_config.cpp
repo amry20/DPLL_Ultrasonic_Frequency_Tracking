@@ -9,6 +9,7 @@
 #include "dpll_controller.h"
 #include "dds_ad9833.h"
 #include "dac_output.h"
+#include "phase_capture.h"
 #include <string.h>
 #include <math.h>
 
@@ -55,6 +56,9 @@ namespace eeprom_config
         cfg.signalLossBehavior   = (uint8_t)dpll::getSignalLossBehavior();
         cfg.generatorSource      = (uint8_t)dpll::getGeneratorSource();
         cfg.ddsMcoClock          = (uint8_t)dds::getMcoClock();
+        cfg.captureRefEdge       = (uint8_t)phase_capture::getRefEdge();
+        cfg.captureZcdEdge       = (uint8_t)phase_capture::getZcdEdge();
+        cfg.trackingDirection    = (uint8_t)dpll::getTrackingDirection();
         cfg.ddsCenterFreq        = dpll::getDdsCenterFreq();
         cfg.ddsMinFreq           = dpll::getDdsMinFreq();
         cfg.ddsMaxFreq           = dpll::getDdsMaxFreq();
@@ -92,12 +96,12 @@ namespace eeprom_config
             return false;
         }
 
-        if (cfg.magic != CONFIG_MAGIC || (cfg.version != 1 && cfg.version != 2))
+        if (cfg.magic != CONFIG_MAGIC || (cfg.version != 1 && cfg.version != 2 && cfg.version != 3 && cfg.version != 4))
         {
             return false;
         }
 
-        size_t crcLen = (cfg.version == 2) ? offsetof(PackedConfig, crc32) : 56;
+        size_t crcLen = (cfg.version >= 2) ? offsetof(PackedConfig, crc32) : 56;
         uint32_t expectedCrc = calcCrc32(reinterpret_cast<const uint8_t *>(&cfg), crcLen);
         if (cfg.crc32 != expectedCrc)
         {
@@ -126,6 +130,37 @@ namespace eeprom_config
             {
                 dds::setMcoClock((dds::McoClockSelection)cfg.ddsMcoClock);
             }
+        }
+
+        // Apply capture edge polarities if version >= 3
+        if (cfg.version >= 3)
+        {
+            if (cfg.captureRefEdge <= 2)
+            {
+                phase_capture::setRefEdge((phase_capture::EdgePolarity)cfg.captureRefEdge);
+            }
+            if (cfg.captureZcdEdge <= 2)
+            {
+                phase_capture::setZcdEdge((phase_capture::EdgePolarity)cfg.captureZcdEdge);
+            }
+        }
+        else
+        {
+            phase_capture::setRefEdge(phase_capture::CAPTURE_RISING);
+            phase_capture::setZcdEdge(phase_capture::CAPTURE_RISING);
+        }
+
+        // Apply tracking direction if version >= 4
+        if (cfg.version >= 4)
+        {
+            if (cfg.trackingDirection <= 1)
+            {
+                dpll::setTrackingDirection((dpll::TrackingDirection)cfg.trackingDirection);
+            }
+        }
+        else
+        {
+            dpll::setTrackingDirection(dpll::TRACKING_DIR_NORMAL);
         }
 
         dpll::begin(cfg.centerVoltage, cfg.kp, cfg.ki, cfg.kd);
@@ -212,6 +247,9 @@ namespace eeprom_config
 
         dac::setVoltage(1.65f);
         dds::setFrequency(28000.0);
+        phase_capture::setRefEdge(phase_capture::CAPTURE_RISING);
+        phase_capture::setZcdEdge(phase_capture::CAPTURE_RISING);
+        dpll::setTrackingDirection(dpll::TRACKING_DIR_NORMAL);
 
         return ok;
     }

@@ -116,9 +116,9 @@ void setup()
                    dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution(), dds::getFrequency());
 
   // Initialize 32-bit Input Capture on TIM2:
-  // PA0 = Reference input (Rising edge trigger)
-  // PA1 = ZCD feedback input (Rising edge trigger)
-  phase_capture::begin(PA0, PA1, phase_capture::CAPTURE_RISING, phase_capture::CAPTURE_RISING, 1);
+  // PA0 = Reference input (Rising/Falling/Both edge trigger from configuration)
+  // PA1 = ZCD feedback input (Rising/Falling/Both edge trigger from configuration)
+  phase_capture::begin(PA0, PA1, phase_capture::getRefEdge(), phase_capture::getZcdEdge(), 1);
 }
 
 void loop()
@@ -284,13 +284,14 @@ void commandProccessor()
         dpll::shutdown();
         break;
       case OPCODE_SET_VOLTAGE:
-        if (plen >= 5)
+        if (plen >= 4)
         {
           float v = payloadFloat();
           if (v >= 0.0f && v <= 3.3f)
           {
             dpll::setManualMode(true);
             dpll::manualSet(v);
+            DebugPort.printf("[DPLL] Manual DAC voltage set: %.3f V (loop disengaged)\n", v);
           }
         }
         break;
@@ -300,7 +301,7 @@ void commandProccessor()
 
       // --- Loop / acquisition config ---
       case OPCODE_SET_LOOP_PERIOD:
-        if (plen >= 5)
+        if (plen >= 4)
         {
           uint32_t v = payloadU32();
           if (v >= 1 && v <= 1000) dpll::setLoopPeriodMs(v);
@@ -310,7 +311,7 @@ void commandProccessor()
         sendU32(OPCODE_GET_LOOP_PERIOD, dpll::getLoopPeriodMs());
         break;
       case OPCODE_SET_LOCK_THRESHOLD:
-        if (plen >= 5) dpll::setLockThresholdNs(payloadFloat());
+        if (plen >= 4) dpll::setLockThresholdNs(payloadFloat());
         break;
       case OPCODE_GET_LOCK_THRESHOLD:
         sendFloat(OPCODE_GET_LOCK_THRESHOLD, dpll::getLockThresholdNs());
@@ -320,7 +321,13 @@ void commandProccessor()
         {
           bool on = pl[0] != 0;
           dpll::setManualMode(on);
-          if (on) dpll::manualSet(dpll::getCenterVoltage());
+          if (on) {
+            dpll::enable(false);
+            DebugPort.println("[DPLL] Manual test mode engaged (closed loop disabled)");
+          } else {
+            dpll::enable(true);
+            DebugPort.println("[DPLL] Closed loop tracking resumed");
+          }
         }
         break;
       case OPCODE_GET_MANUAL_MODE:
@@ -466,6 +473,45 @@ void commandProccessor()
         com::sendPacket(OPCODE_GET_DDS_MCO_CLOCK, 0, &clkSel, 1);
         break;
       }
+      case OPCODE_SET_CAPTURE_EDGE:
+        if (plen >= 2)
+        {
+          uint8_t refE = pl[0];
+          uint8_t zcdE = pl[1];
+          if (refE <= 2) phase_capture::setRefEdge((phase_capture::EdgePolarity)refE);
+          if (zcdE <= 2) phase_capture::setZcdEdge((phase_capture::EdgePolarity)zcdE);
+          DebugPort.printf("[CAPTURE] Edge polarity set: REF=%s, ZCD=%s\n",
+                           refE == 1 ? "FALLING" : (refE == 2 ? "BOTH" : "RISING"),
+                           zcdE == 1 ? "FALLING" : (zcdE == 2 ? "BOTH" : "RISING"));
+        }
+        break;
+      case OPCODE_GET_CAPTURE_EDGE:
+      {
+        uint8_t edges[2] = {
+          (uint8_t)phase_capture::getRefEdge(),
+          (uint8_t)phase_capture::getZcdEdge()
+        };
+        com::sendPacket(OPCODE_GET_CAPTURE_EDGE, 0, edges, sizeof(edges));
+        break;
+      }
+      case OPCODE_SET_TRACKING_DIR:
+        if (plen >= 1)
+        {
+          uint8_t dir = pl[0];
+          if (dir <= 1)
+          {
+            dpll::setTrackingDirection((dpll::TrackingDirection)dir);
+            DebugPort.printf("[DPLL] Tracking direction set to: %s\n",
+                             dir == 1 ? "INVERTED (Parallel fp)" : "NORMAL (Series fs)");
+          }
+        }
+        break;
+      case OPCODE_GET_TRACKING_DIR:
+      {
+        uint8_t dir = (uint8_t)dpll::getTrackingDirection();
+        com::sendPacket(OPCODE_GET_TRACKING_DIR, 0, &dir, 1);
+        break;
+      }
     }
   }
 }
@@ -541,8 +587,9 @@ void sendMonitorStream()
   }
 
   dpllStatusData status;
-  // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK
-  if (!data.refValid)        status.LockStatus = 0;
+  // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
+  if (dpll::getManualMode()) status.LockStatus = 4;
+  else if (!data.refValid)   status.LockStatus = 0;
   else if (!data.zcdPresent) status.LockStatus = 1;
   else if (!isLocked)        status.LockStatus = 2;
   else                       status.LockStatus = 3;
@@ -566,6 +613,10 @@ void sendMonitorStream()
   if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
   {
     ddsSt |= 0x80; // Bit 7 set indicates DDS is active generator source
+  }
+  if (dpll::getTrackingDirection() == dpll::TRACKING_DIR_INVERTED)
+  {
+    ddsSt |= 0x40; // Bit 6 set indicates tracking direction is INVERTED (diagnostic)
   }
   status.DdsStatus = ddsSt;
 
@@ -594,6 +645,10 @@ void processDPLL()
   static uint32_t lockHoldCount = 0;
   static uint32_t railClampCount = 0;
   static uint32_t trackCycles = 0;
+  // Number of windows to ignore right after a pulse starts. The first window
+  // after power-up contains the transducer start-up transient (phase swings up
+  // to +-90 deg), which kicked the DAC in a random direction.
+  static uint32_t settleCycles = 0;
 
   uint32_t nowMs = millis();
 
@@ -643,11 +698,12 @@ void processDPLL()
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        dpll::enable(false); // Hold last DAC
+        dpll::enable(false); // Hold last frequency / DAC voltage
         break;
     }
     dpll::tickSignalAbsent(nowMs);
     phase_capture::clearWindowData();
+    phase_capture::resetFilterState(); // Prepare filter for immediate acceptance on next pulse
     lastDacUpdate = millis();
     return;
   }
@@ -655,97 +711,138 @@ void processDPLL()
   // Signal is valid
   dpll::tickSignalAbsent(0); // Signal present
 
-  // The capture ISR collected every REF/ZCD pair during the settling window.
-  // Do not let a noisy, spiking, overflowing, or abruptly shifted window alter
-  // either the DAC or the integrator. A persistent large shift is accepted only
-  // after it is repeated in a second clean window by consumeWindowData().
-  if (!window.trustworthy) {
+  // State Transition & Re-acquisition logic
+  if (state == STATE_NO_SIGNAL) {
+    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER) {
+      dpll::reset();
+      DebugPort.printf("[DPLL] Re-acquire: reset to center\n");
+    } else {
+      // FREEZE / Resume: continuously track from the last operating point
+      if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+        float lastF = dpll::lastFrequency();
+        dpll::restartAtFrequency(lastF);
+        DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", lastF);
+      } else {
+        float lastV = dpll::lastVoltage();
+        dpll::restartAtVoltage(lastV);
+        DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", lastV, data.frequencyHz);
+      }
+    }
+    settleCycles = 0;
+    state = STATE_TRACKING;
     lockHoldCount = 0;
-    if (state == STATE_LOCKED) state = STATE_TRACKING;
-    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), (state == STATE_LOCKED) ? HIGH : LOW);
+    railClampCount = 0;
+    trackCycles = 0;
+    phase_capture::resetFilterState();
+  }
 
+  // Ignore the start-up transient windows of each pulse (no PID update).
+  if (settleCycles < 2) {
+    settleCycles++;
+    phase_capture::clearWindowData();
+    lastDacUpdate = millis();
+    return;
+  }
+
+  // Window confidence filtering:
+  // Bypass window rejection at the start of a pulse (trackCycles < 2) so the DPLL
+  // immediately begins tracking without wasting 40-60 ms of a 450 ms sonication pulse.
+  bool pulseStart = (trackCycles < 2);
+  float filteredPhaseNs = window.phaseDiffNs;
+  bool usedFallback = false;
+
+  if (!window.trustworthy) {
+    // The strict filter rejected this window. Previously this froze the loop
+    // for the whole sonication pulse (the frequency never moved). Instead fall
+    // back to the best available estimate, bounded to a sane range, so the
+    // PID keeps tracking. Lock is never declared from a fallback window.
+    const float halfPeriodNs = (data.frequencyHz > 1.0f) ? (0.5e9f / data.frequencyHz) : 15000.0f;
+    float fb = window.phaseComputed ? window.phaseDiffNs : data.phaseDiffNs;
+    const bool usable = !window.overflow && (window.sampleCount >= 2 || data.valid) &&
+                        fabsf(fb) < (0.8f * halfPeriodNs);
     static uint32_t lastFilterLogMs = 0;
     if (nowMs - lastFilterLogMs >= 500U) {
       lastFilterLogMs = nowMs;
-      DebugPort.printf("[DPLL FILTER HOLD] N=%u accepted=%u outlier=%.1f%% noise=%.2f deg slope=%.2f deg/ms%s%s\n",
+      DebugPort.printf("[DPLL FILTER FALLBACK] N=%u accepted=%u outlier=%.1f%% noise=%.2f deg slope=%.2f deg/ms%s%s phase=%.0f ns %s\n",
                        window.sampleCount,
                        window.acceptedCount,
                        window.outlierRatio * 100.0f,
                        window.noiseMadDeg,
                        window.slopeDegPerMs,
                        window.largeShift ? " LARGE_SHIFT" : "",
-                       window.overflow ? " OVERFLOW" : "");
+                       window.overflow ? " OVERFLOW" : "",
+                       fb,
+                       usable ? "USED" : "SKIPPED");
     }
-    phase_capture::clearWindowData();
-    lastDacUpdate = millis();
-    return;
-  }
-
-  const float filteredPhaseNs = window.phaseDiffNs;
-
-  // State Transition & Re-acquisition logic
-  if (state == STATE_NO_SIGNAL) {
-    float startV;
-    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER || !dpll::haveLockedCenter()) {
-      startV = dpll::getCenterVoltage();
-      dpll::reset();
-    } else {
-      startV = dpll::getLockedCenterV();
-      dpll::restartAtVoltage(startV);
+    if (!usable) {
+      lockHoldCount = 0;
+      if (state == STATE_LOCKED) state = STATE_TRACKING;
+      digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
+      phase_capture::clearWindowData();
+      lastDacUpdate = millis();
+      return;
     }
-    state = STATE_ACQUIRING;
-    lockHoldCount = 0;
-    railClampCount = 0;
-    trackCycles = 0;
-    DebugPort.printf("[DPLL] Re-acquire start at %.3f V (Freq: %.1f Hz)\n", startV, data.frequencyHz);
+    filteredPhaseNs = fb;
+    usedFallback = true;
   }
+  (void)pulseStart;
 
-  // Run PI controller update
+  // Run PI controller update (Continuous Incremental Tracker)
   dpll::enable(true);
-  float newDacV = dpll::update(filteredPhaseNs, dt);
+  float controlOutput = dpll::update(filteredPhaseNs, dt);
   trackCycles++;
 
-  // Check if controller is pinned to rails (0.0 V or 3.3 V)
-  if (newDacV <= 0.005f || newDacV >= 3.295f) {
+  // Check if controller is pinned to rails:
+  // In DAC mode: check 0.05 V - 3.25 V
+  // In DDS mode: check within 5 Hz of [minFreq, maxFreq]
+  bool isRailed = false;
+  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+    float currF = controlOutput;
+    float minF  = dpll::getDdsMinFreq();
+    float maxF  = dpll::getDdsMaxFreq();
+    if (currF <= (minF + 5.0f) || currF >= (maxF - 5.0f)) {
+      isRailed = true;
+    }
+  } else {
+    float currV = dac::lastRaw() * (3.3f / 4095.0f);
+    if (currV <= 0.05f || currV >= 3.25f) {
+      isRailed = true;
+    }
+  }
+
+  if (isRailed) {
     railClampCount++;
   } else {
     railClampCount = 0;
   }
 
-  // Anti-Divergence / Rail Recovery
-  // Keep recovery time constant when the loop period changes. At 20 ms these
-  // evaluate to the original 10 and 150 cycles; at 1 ms they become 200 and
-  // 3000 cycles instead of making recovery twenty times too aggressive.
-  const uint32_t loopPeriodMs = dpll::getLoopPeriodMs();
-  const uint32_t kMaxRailCycles = (200U + loopPeriodMs - 1U) / loopPeriodMs;
-  const uint32_t kMaxTrackCycles = (3000U + loopPeriodMs - 1U) / loopPeriodMs;
-  if (railClampCount >= kMaxRailCycles || (state == STATE_TRACKING && trackCycles >= kMaxTrackCycles)) {
-    DebugPort.printf("[DPLL RECOVERY] %s — resetting to center voltage %.3f V\n",
-                     (railClampCount >= kMaxRailCycles) ? "Rail Clamped" : "Track Timeout",
-                     dpll::getCenterVoltage());
-    dpll::clearLockedCenter();
-    dpll::reset();
-    state = STATE_ACQUIRING;
-    railClampCount = 0;
-    trackCycles = 0;
-    lockHoldCount = 0;
-    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
-    phase_capture::clearWindowData();
-    lastDacUpdate = millis();
-    return;
+  // Rail Clamping: dpll::update() already clamps within limits with anti-windup.
+  // Do NOT reset to center mid-way — allow continuous smooth tracking!
+  static uint32_t lastRailWarnMs = 0;
+  if (isRailed) {
+    if (nowMs - lastRailWarnMs >= 1000U) {
+      lastRailWarnMs = nowMs;
+      DebugPort.printf("[DPLL RAIL] Pinned to %s rail limit!\n",
+                       dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS ? "DDS Frequency" : "DAC Voltage");
+    }
   }
 
   // Check Lock Condition
-  bool withinLockWindow = (fabsf(filteredPhaseNs - dpll::getTargetPhase()) <= kLockThr);
+  bool withinLockWindow = !usedFallback && (fabsf(filteredPhaseNs - dpll::getTargetPhase()) <= kLockThr);
 
   if (withinLockWindow) {
     lockHoldCount++;
     if (lockHoldCount >= dpll::getLockHoldCycles()) {
       if (state != STATE_LOCKED) {
         state = STATE_LOCKED;
-        dpll::setLockedCenter(newDacV);
-        DebugPort.printf("[DPLL LOCKED] DAC = %.3f V | Freq = %.1f Hz | Phase = %.1f ns\n",
-                         newDacV, data.frequencyHz, filteredPhaseNs);
+        dpll::setLockedCenter(controlOutput);
+        if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+          DebugPort.printf("[DPLL LOCKED] Freq = %.1f Hz | Phase = %.1f ns\n",
+                           controlOutput, filteredPhaseNs);
+        } else {
+          DebugPort.printf("[DPLL LOCKED] DAC = %.3f V | Freq = %.1f Hz | Phase = %.1f ns\n",
+                           controlOutput, data.frequencyHz, filteredPhaseNs);
+        }
       }
     }
   } else {
@@ -753,8 +850,6 @@ void processDPLL()
     if (state == STATE_LOCKED) {
       state = STATE_TRACKING;
       DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns\n", filteredPhaseNs);
-    } else if (state == STATE_ACQUIRING) {
-      state = STATE_TRACKING;
     }
   }
 
@@ -795,6 +890,7 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  source <dac|dds> : select generator source (CD4046 VCO vs AD9833 DDS)"));
     DebugPort.println(F("  ddsfreq <hz>  : set DDS center frequency"));
     DebugPort.println(F("  ddsrange <min> <max> : set DDS tracking limits (Hz)"));
+    DebugPort.println(F("  edge [ref 0..2] [zcd 0..2] : set capture edge polarity (0=rising, 1=falling, 2=both)"));
   }
   else if (name == "dac")
   {
@@ -854,9 +950,11 @@ void handleDebugCommand(const String &cmd)
   }
   else if (name == "gain")
   {
-    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | hold=%u | timeout=%u ms | stream=%u ms | lockedV=%.3f V%s | loss=%u\n",
+    DebugPort.printf("Kp=%.6f V/ns | Ki=%.6f V/ns/s | Kd=%.6f V/ns/s | center=%.2f V | target=%.1f ns | dir=%s | slew=%.1f V/s | manual=%s | loop=%u ms | thr=%.0f ns | hold=%u | timeout=%u ms | stream=%u ms | lockedV=%.3f V%s | loss=%u\n",
                   dpll::getKp(), dpll::getKi(), dpll::getKd(), dpll::getCenterVoltage(),
-                  dpll::getTargetPhase(), dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
+                  dpll::getTargetPhase(),
+                  dpll::getTrackingDirection() == dpll::TRACKING_DIR_INVERTED ? "INVERTED" : "NORMAL",
+                  dpll::getMaxSlew(), dpll::getManualMode() ? "yes" : "no",
                   dpll::getLoopPeriodMs(), dpll::getLockThresholdNs(),
                   dpll::getLockHoldCycles(), dpll::getLockMemoryTimeoutMs(),
                   dpll::getStreamPeriodMs(),
@@ -901,7 +999,26 @@ void handleDebugCommand(const String &cmd)
   {
     dpll::setManualMode(false);
     dpll::enable(true);
-    DebugPort.println("Control loop enabled");
+    DebugPort.println("Control loop enabled (closed-loop DPLL tracking active)");
+  }
+  else if (name == "stop" || name == "manual")
+  {
+    dpll::setManualMode(true);
+    dpll::enable(false);
+    DebugPort.println("Control loop disabled (open-loop fixed test mode active)");
+  }
+  else if (name == "fixed" || name == "test")
+  {
+    float f = arg.toFloat();
+    if (f >= 1.0f && f <= 500000.0f)
+    {
+      dpll::manualSetFreq(f);
+      DebugPort.printf("Fixed test frequency set to %.2f Hz (loop disabled)\n", f);
+    }
+    else
+    {
+      DebugPort.println("ERR: Frequency must be 1.0 - 500000.0 Hz");
+    }
   }
   else if (name == "loss")
   {
@@ -1335,6 +1452,56 @@ void handleDebugCommand(const String &cmd)
       {
         DebugPort.println(F("ERR: Usage: ddsrange <min_hz> <max_hz>"));
       }
+    }
+  }
+  else if (name == "edge")
+  {
+    if (arg.length() == 0)
+    {
+      const char* edgeNames[] = {"RISING", "FALLING", "BOTH"};
+      DebugPort.printf("Capture edges: REF (PA0) = %s (%u), ZCD (PA1) = %s (%u)\n",
+                       edgeNames[(uint8_t)phase_capture::getRefEdge()], (uint8_t)phase_capture::getRefEdge(),
+                       edgeNames[(uint8_t)phase_capture::getZcdEdge()], (uint8_t)phase_capture::getZcdEdge());
+    }
+    else
+    {
+      int sp2 = arg.indexOf(' ');
+      int p1 = (sp2 < 0) ? arg.toInt() : arg.substring(0, sp2).toInt();
+      int p2 = (sp2 < 0) ? p1 : arg.substring(sp2 + 1).toInt();
+      if (p1 >= 0 && p1 <= 2 && p2 >= 0 && p2 <= 2)
+      {
+        phase_capture::setRefEdge((phase_capture::EdgePolarity)p1);
+        phase_capture::setZcdEdge((phase_capture::EdgePolarity)p2);
+        const char* edgeNames[] = {"RISING", "FALLING", "BOTH"};
+        DebugPort.printf("Capture edges set: REF=%s, ZCD=%s\n", edgeNames[p1], edgeNames[p2]);
+      }
+      else
+      {
+        DebugPort.println(F("ERR: edge <ref 0..2> [zcd 0..2] (0=Rising, 1=Falling, 2=Both)"));
+      }
+    }
+  }
+  else if (name == "dir" || name == "direction")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("Tracking Direction: %s (%u)\n",
+                       dpll::getTrackingDirection() == dpll::TRACKING_DIR_INVERTED ? "INVERTED (Parallel fp)" : "NORMAL (Series fs)",
+                       (uint8_t)dpll::getTrackingDirection());
+    }
+    else if (arg == "0" || arg == "normal" || arg == "fs")
+    {
+      dpll::setTrackingDirection(dpll::TRACKING_DIR_NORMAL);
+      DebugPort.println(F("Tracking Direction set to NORMAL (Series fs resonance)."));
+    }
+    else if (arg == "1" || arg == "inverted" || arg == "fp" || arg == "inv")
+    {
+      dpll::setTrackingDirection(dpll::TRACKING_DIR_INVERTED);
+      DebugPort.println(F("Tracking Direction set to INVERTED (Parallel fp resonance / Inverting)."));
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Usage: dir <0=normal|1=inverted>"));
     }
   }
   else

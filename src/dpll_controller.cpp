@@ -15,6 +15,7 @@ namespace dpll {
 namespace {
 
 GeneratorSource s_generatorSource = GENERATOR_SOURCE_DAC;
+TrackingDirection s_trackingDirection = TRACKING_DIR_NORMAL;
 
 // DAC mode PID gains (V/ns, V/ns/s)
 float s_dacKp = 0.000002f;
@@ -71,9 +72,15 @@ bool     s_signalWasAbsent     = false;
 void begin(float centerVoltage, float kp, float ki, float kd)
 {
   s_centerVoltage = centerVoltage;
-  s_dacKp = kp;
-  s_dacKi = ki;
-  s_dacKd = kd;
+  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+    s_ddsKp = kp;
+    s_ddsKi = ki;
+    s_ddsKd = kd;
+  } else {
+    s_dacKp = kp;
+    s_dacKi = ki;
+    s_dacKd = kd;
+  }
   s_integral = 0.0f;
   s_outputVoltage = centerVoltage;
   s_outputFreq = s_ddsCenterFreq;
@@ -122,6 +129,16 @@ void setGeneratorSource(GeneratorSource src)
     s_outputFreq = s_ddsCenterFreq;
     dds::setFrequency((double)s_outputFreq);
   }
+}
+
+TrackingDirection getTrackingDirection()
+{
+  return s_trackingDirection;
+}
+
+void setTrackingDirection(TrackingDirection dir)
+{
+  s_trackingDirection = dir;
 }
 
 float getDdsCenterFreq()
@@ -227,6 +244,9 @@ void enable(bool on)
     }
     s_haveLastError = false;
   }
+  if (on) {
+    s_manualMode = false;
+  }
   s_enabled = on;
 }
 
@@ -237,24 +257,24 @@ bool isEnabled()
 
 void reset()
 {
-  s_integral = 0.0f;
+  s_manualMode = false;
+  s_outputVoltage = s_centerVoltage;
+  s_outputFreq = s_ddsCenterFreq;
   s_haveLastError = false;
 
   if (s_generatorSource == GENERATOR_SOURCE_DDS) {
-    s_outputFreq = s_ddsCenterFreq;
     dds::setFrequency((double)s_outputFreq);
   } else {
-    s_outputVoltage = s_centerVoltage;
     dac::setVoltage(s_outputVoltage);
   }
 }
 
 void restartAtVoltage(float startingVoltage)
 {
+  if (s_manualMode) return; // Do not disturb manual test mode
   if (startingVoltage < s_minVoltage) startingVoltage = s_minVoltage;
   if (startingVoltage > s_maxVoltage) startingVoltage = s_maxVoltage;
   s_outputVoltage = startingVoltage;
-  s_integral = startingVoltage - s_centerVoltage;
   s_haveLastError = false;
   s_enabled = true;
   if (s_generatorSource == GENERATOR_SOURCE_DAC) {
@@ -264,10 +284,10 @@ void restartAtVoltage(float startingVoltage)
 
 void restartAtFrequency(float startingFreq)
 {
+  if (s_manualMode) return; // Do not disturb manual test mode
   if (startingFreq < s_ddsMinFreq) startingFreq = s_ddsMinFreq;
   if (startingFreq > s_ddsMaxFreq) startingFreq = s_ddsMaxFreq;
   s_outputFreq = startingFreq;
-  s_integral = startingFreq - s_ddsCenterFreq;
   s_haveLastError = false;
   s_enabled = true;
   if (s_generatorSource == GENERATOR_SOURCE_DDS) {
@@ -292,12 +312,15 @@ float update(float phaseErrorNs, float dtSeconds)
 
   // Error in nanoseconds (target - measured)
   float error = s_targetPhaseNs - phaseErrorNs;
+  if (s_trackingDirection == TRACKING_DIR_INVERTED) {
+    error = -error;
+  }
 
   if (s_generatorSource == GENERATOR_SOURCE_DDS)
   {
-    // --- Direct DDS Frequency Tracking ---
-    float proportional = s_ddsKp * error;
-    s_integral += s_ddsKi * error * dtSeconds;
+    // --- Direct DDS Frequency Tracking (Continuous Incremental Form: f_new = f_curr ± Δf) ---
+    float deltaProp = s_ddsKp * error;
+    float deltaInt  = s_ddsKi * error * dtSeconds;
 
     float derivative = 0.0f;
     if (s_haveLastError) {
@@ -306,37 +329,37 @@ float update(float phaseErrorNs, float dtSeconds)
     s_lastError = error;
     s_haveLastError = true;
 
-    float freq = s_ddsCenterFreq + proportional + s_integral + derivative;
+    // Accumulate integral smoothly from current operating point
+    s_outputFreq += deltaInt;
+    float targetFreq = s_outputFreq + deltaProp + derivative;
 
-    // Clamp output within frequency bounds [min, max]
-    if (freq > s_ddsMaxFreq) {
-      freq = s_ddsMaxFreq;
-      s_integral = s_ddsMaxFreq - s_ddsCenterFreq - proportional;
-    } else if (freq < s_ddsMinFreq) {
-      freq = s_ddsMinFreq;
-      s_integral = s_ddsMinFreq - s_ddsCenterFreq - proportional;
+    // Clamp output within frequency bounds [min, max] with anti-windup
+    if (targetFreq > s_ddsMaxFreq) {
+      targetFreq = s_ddsMaxFreq;
+      s_outputFreq = s_ddsMaxFreq - deltaProp;
+    } else if (targetFreq < s_ddsMinFreq) {
+      targetFreq = s_ddsMinFreq;
+      s_outputFreq = s_ddsMinFreq - deltaProp;
     }
 
     // Frequency slew-rate limiting (Hz/s)
     float maxStep = s_ddsMaxSlew * dtSeconds;
-    if (freq - s_outputFreq > maxStep) {
-      freq = s_outputFreq + maxStep;
-      s_integral = freq - s_ddsCenterFreq - proportional;
-    } else if (s_outputFreq - freq > maxStep) {
-      freq = s_outputFreq - maxStep;
-      s_integral = freq - s_ddsCenterFreq - proportional;
+    float lastF = static_cast<float>(dds::getFrequency());
+    if (lastF <= 0.0f) lastF = s_outputFreq;
+    if (targetFreq - lastF > maxStep) {
+      targetFreq = lastF + maxStep;
+    } else if (lastF - targetFreq > maxStep) {
+      targetFreq = lastF - maxStep;
     }
 
-    s_outputFreq = freq;
-    dds::setFrequency((double)s_outputFreq);
-
-    return s_outputFreq;
+    dds::setFrequency((double)targetFreq);
+    return targetFreq;
   }
   else
   {
-    // --- External VCO DAC Voltage Tracking ---
-    float proportional = s_dacKp * error;
-    s_integral += s_dacKi * error * dtSeconds;
+    // --- External VCO DAC Voltage Tracking (Continuous Incremental Form: V_new = V_curr ± ΔV) ---
+    float deltaProp = s_dacKp * error;
+    float deltaInt  = s_dacKi * error * dtSeconds;
 
     float derivative = 0.0f;
     if (s_haveLastError) {
@@ -345,31 +368,29 @@ float update(float phaseErrorNs, float dtSeconds)
     s_lastError = error;
     s_haveLastError = true;
 
-    float voltage = s_centerVoltage + proportional + s_integral + derivative;
+    s_outputVoltage += deltaInt;
+    float targetV = s_outputVoltage + deltaProp + derivative;
 
-    // Clamp output
-    if (voltage > s_maxVoltage) {
-      voltage = s_maxVoltage;
-      s_integral = s_maxVoltage - s_centerVoltage - proportional;
-    } else if (voltage < s_minVoltage) {
-      voltage = s_minVoltage;
-      s_integral = s_minVoltage - s_centerVoltage - proportional;
+    // Clamp output with anti-windup
+    if (targetV > s_maxVoltage) {
+      targetV = s_maxVoltage;
+      s_outputVoltage = s_maxVoltage - deltaProp;
+    } else if (targetV < s_minVoltage) {
+      targetV = s_minVoltage;
+      s_outputVoltage = s_minVoltage - deltaProp;
     }
 
     // Voltage slew-rate limit
     float maxStep = s_maxSlew * dtSeconds;
-    if (voltage - s_outputVoltage > maxStep) {
-      voltage = s_outputVoltage + maxStep;
-      s_integral = voltage - s_centerVoltage - proportional;
-    } else if (s_outputVoltage - voltage > maxStep) {
-      voltage = s_outputVoltage - maxStep;
-      s_integral = voltage - s_centerVoltage - proportional;
+    float lastV = dac::lastRaw() * (3.3f / 4095.0f);
+    if (targetV - lastV > maxStep) {
+      targetV = lastV + maxStep;
+    } else if (lastV - targetV > maxStep) {
+      targetV = lastV - maxStep;
     }
 
-    s_outputVoltage = voltage;
-    dac::setVoltage(s_outputVoltage);
-
-    return s_outputVoltage;
+    dac::setVoltage(targetV);
+    return targetV;
   }
 }
 
@@ -392,6 +413,7 @@ void shutdown()
 
 void manualSet(float voltage)
 {
+  s_manualMode = true;
   s_enabled = false;
   s_integral = 0.0f;
   s_generatorSource = GENERATOR_SOURCE_DAC;
@@ -403,6 +425,7 @@ void manualSet(float voltage)
 
 void manualSetFreq(float freqHz)
 {
+  s_manualMode = true;
   s_enabled = false;
   s_integral = 0.0f;
   s_generatorSource = GENERATOR_SOURCE_DDS;

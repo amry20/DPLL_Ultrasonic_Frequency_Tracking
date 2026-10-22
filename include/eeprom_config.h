@@ -12,7 +12,7 @@
 namespace eeprom_config
 {
     static constexpr uint32_t CONFIG_MAGIC = 0x44504C31; // "DPL1" in ASCII
-    static constexpr uint16_t CONFIG_VERSION = 2;
+    static constexpr uint16_t CONFIG_VERSION = 4;
     static constexpr uint16_t EEPROM_CONFIG_ADDR = 0x0000;
 
     struct PackedConfig
@@ -34,7 +34,9 @@ namespace eeprom_config
         uint8_t  signalLossBehavior;
         uint8_t  generatorSource;       // 0=DAC, 1=DDS
         uint8_t  ddsMcoClock;           // McoClockSelection (0=8MHz HSE, 1=4MHz HSE, etc.)
-        uint8_t  _reserved[1];
+        uint8_t  captureRefEdge;        // 0=Rising, 1=Falling, 2=Both
+        uint8_t  captureZcdEdge;        // 0=Rising, 1=Falling, 2=Both
+        uint8_t  trackingDirection;     // 0=Normal (Series fs), 1=Inverted (Parallel fp)
         float    ddsCenterFreq;        // Hz
         float    ddsMinFreq;           // Hz
         float    ddsMaxFreq;           // Hz

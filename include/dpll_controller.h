@@ -35,6 +35,12 @@ namespace dpll
         GENERATOR_SOURCE_DDS = 1  // Direct DDS (AD9833) frequency modulation via SPI1
     };
 
+    // Tracking loop direction (feedback sign)
+    enum TrackingDirection : uint8_t {
+        TRACKING_DIR_NORMAL   = 0, // Series resonance (fs): error > 0 -> lower freq/voltage
+        TRACKING_DIR_INVERTED = 1  // Parallel resonance (fp) / inverting transfer function: error > 0 -> higher freq/voltage
+    };
+
     // Initialize the controller.
     // centerVoltage : VCO voltage that produces the nominal/center frequency.
     // kp            : proportional gain (V per nanosecond of phase error for DAC, Hz/ns for DDS).
@@ -45,6 +51,10 @@ namespace dpll
     // Generator Source (DAC vs DDS)
     GeneratorSource getGeneratorSource();
     void            setGeneratorSource(GeneratorSource src);
+
+    // Tracking loop direction (Normal vs Inverted)
+    TrackingDirection getTrackingDirection();
+    void              setTrackingDirection(TrackingDirection dir);
 
     // DDS frequency configuration
     float getDdsCenterFreq();

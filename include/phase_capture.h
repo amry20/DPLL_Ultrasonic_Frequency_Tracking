@@ -56,6 +56,7 @@ struct PhaseWindowData {
   bool     overflow;          // Sample bank filled before the window ended
   bool     largeShift;        // Large intra/inter-window phase movement detected
   bool     trustworthy;       // Safe to feed this estimate to the PID
+  bool     phaseComputed;     // phaseDiffNs holds a usable (maybe untrusted) estimate
 };
 
 // Configurable setup function.
@@ -81,6 +82,10 @@ void setRefTimeout(uint32_t timeoutMs);
 void setRefEdge(EdgePolarity edge);
 void setZcdEdge(EdgePolarity edge);
 
+// Get currently configured edge polarity
+EdgePolarity getRefEdge();
+EdgePolarity getZcdEdge();
+
 // Get the latest snapshot of captured phase & period metrics
 CaptureData getData();
 
@@ -93,6 +98,9 @@ PhaseWindowData consumeWindowData();
 // Call immediately after applying (or deliberately holding) the DAC so the
 // next 20 ms measurement window starts at the actual control decision time.
 void clearWindowData();
+
+// Reset robust filter state (anchor, shift candidates) so a new pulse immediately acquires
+void resetFilterState();
 
 // Helper: convert TIM2 ticks to microseconds
 float ticksToUs(uint32_t ticks);
