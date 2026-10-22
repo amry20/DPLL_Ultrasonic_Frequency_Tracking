@@ -35,6 +35,12 @@ volatile bool     s_refValid       = false;
 uint32_t s_zcdTimeoutMs = 50;
 uint32_t s_refTimeoutMs = 100;
 
+// A ZCD edge older than this many REF periods means the ZCD signal is gone
+// (pulse ended). Without this check the millisecond timeout kept `valid` true
+// for tens of ms after the last ZCD edge, and the stale ZCD timestamp was
+// paired with fresh REF edges -> random phase in +-period/2.
+constexpr uint32_t kZcdMaxAgePeriods = 64; // ~1.9 ms at 33.5 kHz
+
 constexpr float kTimerClockHz = 84000000.0f; // 84 MHz APB1 timer clock on STM32F407
 
 // At 35 kHz a 20 ms window contains about 700 samples. 1024 leaves headroom
@@ -275,9 +281,11 @@ CaptureData getData()
 
   uint32_t lastZcdMs = 0;
   uint32_t lastRefMs = 0;
+  uint32_t nowTicks  = 0;
 
   // Atomic snapshot of ISR variables
   noInterrupts();
+  nowTicks            = s_timer ? s_timer->getCount() : 0;
   out.refTimestamp    = s_lastRefCapture;
   out.zcdTimestamp    = s_lastZcdCapture;
   out.periodTicks     = s_periodTicks;
@@ -292,6 +300,12 @@ CaptureData getData()
 
   // Freshness checks: signal must be present AND recently active
   out.zcdPresent = (lastZcdMs > 0) && ((now - lastZcdMs) <= s_zcdTimeoutMs);
+  if (out.zcdPresent && out.periodTicks != 0) {
+    const uint32_t zcdAgeTicks = nowTicks - out.zcdTimestamp;
+    if (zcdAgeTicks > kZcdMaxAgePeriods * out.periodTicks) {
+      out.zcdPresent = false;
+    }
+  }
   out.refValid   = s_refValid && (lastRefMs > 0) && ((now - lastRefMs) <= s_refTimeoutMs);
   out.valid      = out.refValid && out.zcdPresent;
 
