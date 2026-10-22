@@ -47,8 +47,8 @@ extern "C" void SystemClock_Config(void)
   }
 }
 
-#define HEARTBEAT_LED PC_13
-#define LOCK_INDICATOR_LED PC_10 // active high. Lock indictor when state change to Locked.
+#define HEARTBEAT_LED      PC13
+#define LOCK_INDICATOR_LED PC10 // active high. Lock indicator when state changes to Locked.
 void heartbeat();
 void processSerialDebugCommand();
 void processDPLL();
@@ -63,10 +63,17 @@ void setup()
 {
   setupSerialDebug();
   com::begin();
-  pinMode(digitalPinToPinName(HEARTBEAT_LED), OUTPUT);
-  digitalWriteFast(digitalPinToPinName(HEARTBEAT_LED), HIGH);
-  pinMode(digitalPinToPinName(LOCK_INDICATOR_LED), OUTPUT);
-  digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
+  pinMode(HEARTBEAT_LED, OUTPUT);
+  digitalWrite(HEARTBEAT_LED, HIGH);
+  pinMode(LOCK_INDICATOR_LED, OUTPUT);
+  digitalWrite(LOCK_INDICATOR_LED, LOW);
+  // Startup self-test: blink lock indicator LED 3 times (active HIGH)
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LOCK_INDICATOR_LED, HIGH);
+    delay(80);
+    digitalWrite(LOCK_INDICATOR_LED, LOW);
+    delay(80);
+  }
 
   // 1. Initialize 24LC16B I2C EEPROM on PB6 (SCL) and PB7 (SDA)
   if (eeprom::begin(PB6, PB7, 400000))
@@ -87,7 +94,7 @@ void setup()
   {
     // Apply baseline default DPLL & DDS parameters
     dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
-    dpll::setTargetPhase(0.0f);
+    dpll::setTargetPhase(600.0f);
     dpll::setOutputLimits(0.0f, 3.3f);
     dpll::setMaxSlew(30.0f);
     dpll::setDdsCenterFreq(28000.0f);
@@ -118,7 +125,8 @@ void setup()
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising/Falling/Both edge trigger from configuration)
   // PA1 = ZCD feedback input (Rising/Falling/Both edge trigger from configuration)
-  phase_capture::begin(PA0, PA1, phase_capture::getRefEdge(), phase_capture::getZcdEdge(), 1);
+  // zcdTimeoutMs is set to 30 ms to avoid false signal-loss dropouts during sonication.
+  phase_capture::begin(PA0, PA1, phase_capture::getRefEdge(), phase_capture::getZcdEdge(), 30);
 }
 
 void loop()
@@ -198,19 +206,19 @@ void commandProccessor()
 
       // --- PID gains (float LE) ---
       case OPCODE_SET_KP:
-        if (plen >= 5) dpll::setGains(payloadFloat(), dpll::getKi());
+        if (plen >= 4) dpll::setGains(payloadFloat(), dpll::getKi());
         break;
       case OPCODE_GET_KP:
         sendFloat(OPCODE_GET_KP, dpll::getKp());
         break;
       case OPCODE_SET_KI:
-        if (plen >= 5) dpll::setGains(dpll::getKp(), payloadFloat());
+        if (plen >= 4) dpll::setGains(dpll::getKp(), payloadFloat());
         break;
       case OPCODE_GET_KI:
         sendFloat(OPCODE_GET_KI, dpll::getKi());
         break;
       case OPCODE_SET_KD:
-        if (plen >= 5) dpll::setKd(payloadFloat());
+        if (plen >= 4) dpll::setKd(payloadFloat());
         break;
       case OPCODE_GET_KD:
         sendFloat(OPCODE_GET_KD, dpll::getKd());
@@ -218,7 +226,7 @@ void commandProccessor()
 
       // --- Center / target / slew (float LE) ---
       case OPCODE_SET_CENTER_VOLTAGE:
-        if (plen >= 5)
+        if (plen >= 4)
         {
           float v = payloadFloat();
           if (v >= 0.0f && v <= 3.3f)
@@ -229,13 +237,13 @@ void commandProccessor()
         sendFloat(OPCODE_GET_CENTER_VOLTAGE, dpll::getCenterVoltage());
         break;
       case OPCODE_SET_TARGET_PHASE:
-        if (plen >= 5) dpll::setTargetPhase(payloadFloat());
+        if (plen >= 4) dpll::setTargetPhase(payloadFloat());
         break;
       case OPCODE_GET_TARGET_PHASE:
         sendFloat(OPCODE_GET_TARGET_PHASE, dpll::getTargetPhase());
         break;
       case OPCODE_SET_MAX_SLEW:
-        if (plen >= 5)
+        if (plen >= 4)
         {
           float v = payloadFloat();
           if (v > 0.0f) dpll::setMaxSlew(v);
@@ -247,7 +255,7 @@ void commandProccessor()
 
       // --- Output limits (two floats LE) ---
       case OPCODE_SET_OUTPUT_LIMITS:
-        if (plen >= 9)
+        if (plen >= 8)
         {
           float minV = payloadFloat();
           float maxV;
@@ -334,13 +342,13 @@ void commandProccessor()
         sendBool(OPCODE_GET_MANUAL_MODE, dpll::getManualMode());
         break;
       case OPCODE_SET_LOCK_HOLD_CYCLES:
-        if (plen >= 5) dpll::setLockHoldCycles(payloadU32());
+        if (plen >= 4) dpll::setLockHoldCycles(payloadU32());
         break;
       case OPCODE_GET_LOCK_HOLD_CYCLES:
         sendU32(OPCODE_GET_LOCK_HOLD_CYCLES, dpll::getLockHoldCycles());
         break;
       case OPCODE_SET_LOCK_MEMORY_TIMEOUT:
-        if (plen >= 5) dpll::setLockMemoryTimeoutMs(payloadU32());
+        if (plen >= 4) dpll::setLockMemoryTimeoutMs(payloadU32());
         break;
       case OPCODE_GET_LOCK_MEMORY_TIMEOUT:
         sendU32(OPCODE_GET_LOCK_MEMORY_TIMEOUT, dpll::getLockMemoryTimeoutMs());
@@ -359,7 +367,7 @@ void commandProccessor()
         break;
       }
       case OPCODE_SET_STREAM_PERIOD:
-        if (plen >= 5)
+        if (plen >= 4)
         {
           uint32_t v = payloadU32();
           if (v >= 1 && v <= 65535) dpll::setStreamPeriodMs(v);
@@ -551,6 +559,15 @@ void debugPrint()
     }
   }
 }
+// State machine states for DPLL controller
+enum DpllState : uint8_t {
+  STATE_NO_SIGNAL = 0,
+  STATE_ACQUIRING,
+  STATE_TRACKING,
+  STATE_LOCKED
+};
+static DpllState s_dpllState = STATE_NO_SIGNAL;
+
 // Fixed-rate monitor stream — runs independently of the settling window.
 // Rate is set by dpll::getStreamPeriodMs() (default 100 ms = 10 Hz).
 // Sends a packet for ALL states: LOCK, TRACK, WAIT_ZCD, NO_REF.
@@ -565,10 +582,6 @@ void sendMonitorStream()
 
   phase_capture::CaptureData data = phase_capture::getData();
   float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
-  const float kLockThr = dpll::getLockThresholdNs();
-  bool isLocked = data.valid &&
-                  (data.phaseDiffNs >= -kLockThr) &&
-                  (data.phaseDiffNs <=  kLockThr);
 
   // Phase value reported while ZCD/REF is absent. Refreshed ONLY on the first
   // valid measurement after a missing period, so the held value reflects the
@@ -588,11 +601,11 @@ void sendMonitorStream()
 
   dpllStatusData status;
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
-  if (dpll::getManualMode()) status.LockStatus = 4;
-  else if (!data.refValid)   status.LockStatus = 0;
-  else if (!data.zcdPresent) status.LockStatus = 1;
-  else if (!isLocked)        status.LockStatus = 2;
-  else                       status.LockStatus = 3;
+  if (dpll::getManualMode())             status.LockStatus = 4;
+  else if (!data.refValid)               status.LockStatus = 0;
+  else if (!data.zcdPresent)             status.LockStatus = 1;
+  else if (s_dpllState == STATE_LOCKED)  status.LockStatus = 3;
+  else                                   status.LockStatus = 2;
   status.ReferenceFrequencyHz = data.frequencyHz;
   // While ZCD/REF is absent: send the phase captured at the first measurement
   // after re-acquire (off-resonance value), not the pre-loss lock value.
@@ -632,19 +645,13 @@ void processDPLL()
   //   4. Execute PI controller update and apply DAC voltage.
   //   5. Record timestamp for next settling window.
 
-  enum DpllState : uint8_t {
-    STATE_NO_SIGNAL = 0,
-    STATE_ACQUIRING,
-    STATE_TRACKING,
-    STATE_LOCKED
-  };
-
-  static DpllState state = STATE_NO_SIGNAL;
   static uint32_t lastDacUpdate = 0;
   static bool firstRun = true;
   static uint32_t lockHoldCount = 0;
+  static uint32_t unlockHoldCount = 0;
   static uint32_t railClampCount = 0;
   static uint32_t trackCycles = 0;
+  static uint32_t s_lastLockMs = 0;
   // Number of windows to ignore right after a pulse starts. The first window
   // after power-up contains the transducer start-up transient (phase swings up
   // to +-90 deg), which kicked the DAC in a random direction.
@@ -673,7 +680,7 @@ void processDPLL()
 
   // Manual override: loop disengaged
   if (dpll::getManualMode()) {
-    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
+    digitalWrite(LOCK_INDICATOR_LED, LOW);
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
@@ -681,9 +688,12 @@ void processDPLL()
 
   // Check signal presence
   if (!data.valid) {
-    state = STATE_NO_SIGNAL;
-    digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
+    s_dpllState = STATE_NO_SIGNAL;
+    if (nowMs - s_lastLockMs >= 500U) {
+      digitalWrite(LOCK_INDICATOR_LED, LOW);
+    }
     lockHoldCount = 0;
+    unlockHoldCount = 0;
     railClampCount = 0;
     trackCycles = 0;
 
@@ -698,7 +708,14 @@ void processDPLL()
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        dpll::enable(false); // Hold last frequency / DAC voltage
+        if (dpll::haveLockedCenter()) {
+          if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+            dpll::restartAtFrequency(dpll::getLockedCenterV());
+          } else {
+            dpll::restartAtVoltage(dpll::getLockedCenterV());
+          }
+        }
+        dpll::enable(false); // Hold last locked voltage / frequency
         break;
     }
     dpll::tickSignalAbsent(nowMs);
@@ -712,25 +729,26 @@ void processDPLL()
   dpll::tickSignalAbsent(0); // Signal present
 
   // State Transition & Re-acquisition logic
-  if (state == STATE_NO_SIGNAL) {
+  if (s_dpllState == STATE_NO_SIGNAL) {
     if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER) {
       dpll::reset();
       DebugPort.printf("[DPLL] Re-acquire: reset to center\n");
     } else {
-      // FREEZE / Resume: continuously track from the last operating point
+      // FREEZE / Resume: start exactly from the locked center point
       if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
-        float lastF = dpll::lastFrequency();
-        dpll::restartAtFrequency(lastF);
-        DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", lastF);
+        float resumeF = dpll::haveLockedCenter() ? dpll::getLockedCenterV() : dpll::lastFrequency();
+        dpll::restartAtFrequency(resumeF);
+        DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", resumeF);
       } else {
-        float lastV = dpll::lastVoltage();
-        dpll::restartAtVoltage(lastV);
-        DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", lastV, data.frequencyHz);
+        float resumeV = dpll::haveLockedCenter() ? dpll::getLockedCenterV() : dpll::lastVoltage();
+        dpll::restartAtVoltage(resumeV);
+        DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", resumeV, data.frequencyHz);
       }
     }
     settleCycles = 0;
-    state = STATE_TRACKING;
+    s_dpllState = STATE_TRACKING;
     lockHoldCount = 0;
+    unlockHoldCount = 0;
     railClampCount = 0;
     trackCycles = 0;
     phase_capture::resetFilterState();
@@ -758,7 +776,7 @@ void processDPLL()
     // PID keeps tracking. Lock is never declared from a fallback window.
     const float halfPeriodNs = (data.frequencyHz > 1.0f) ? (0.5e9f / data.frequencyHz) : 15000.0f;
     float fb = window.phaseComputed ? window.phaseDiffNs : data.phaseDiffNs;
-    const bool usable = !window.overflow && (window.sampleCount >= 2 || data.valid) &&
+    const bool usable = !window.overflow && (window.sampleCount >= 2) &&
                         fabsf(fb) < (0.8f * halfPeriodNs);
     static uint32_t lastFilterLogMs = 0;
     if (nowMs - lastFilterLogMs >= 500U) {
@@ -775,9 +793,18 @@ void processDPLL()
                        usable ? "USED" : "SKIPPED");
     }
     if (!usable) {
-      lockHoldCount = 0;
-      if (state == STATE_LOCKED) state = STATE_TRACKING;
-      digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), LOW);
+      if (s_dpllState == STATE_LOCKED) {
+        unlockHoldCount++;
+        if (unlockHoldCount >= 3) {
+          s_dpllState = STATE_TRACKING;
+          if (nowMs - s_lastLockMs >= 500U) {
+            digitalWrite(LOCK_INDICATOR_LED, LOW);
+          }
+          lockHoldCount = 0;
+        }
+      } else {
+        lockHoldCount = 0;
+      }
       phase_capture::clearWindowData();
       lastDacUpdate = millis();
       return;
@@ -827,15 +854,33 @@ void processDPLL()
     }
   }
 
-  // Check Lock Condition
-  bool withinLockWindow = !usedFallback && (fabsf(filteredPhaseNs - dpll::getTargetPhase()) <= kLockThr);
+  // Check Lock Condition with hysteresis / debounce
+  const float phaseErr = fabsf(filteredPhaseNs - dpll::getTargetPhase());
+  const bool withinLockWindow = (phaseErr <= kLockThr);
 
-  if (withinLockWindow) {
-    lockHoldCount++;
-    if (lockHoldCount >= dpll::getLockHoldCycles()) {
-      if (state != STATE_LOCKED) {
-        state = STATE_LOCKED;
-        dpll::setLockedCenter(controlOutput);
+  if (s_dpllState == STATE_LOCKED) {
+    // Already LOCKED: require 3 consecutive cycles outside threshold before dropping lock.
+    // Isolated single-cycle noise glitches or fallback windows do NOT cause lock loss or LED flicker.
+    if (!withinLockWindow && (!usedFallback || phaseErr > (kLockThr * 1.5f))) {
+      unlockHoldCount++;
+      if (unlockHoldCount >= 3) {
+        s_dpllState = STATE_TRACKING;
+        lockHoldCount = 0;
+        unlockHoldCount = 0;
+        DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns (target=%.1f, thr=%.1f)\n",
+                         filteredPhaseNs, dpll::getTargetPhase(), kLockThr);
+      }
+    } else {
+      unlockHoldCount = 0;
+      dpll::setLockedCenter(controlOutput);
+    }
+  } else {
+    // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold
+    unlockHoldCount = 0;
+    if (withinLockWindow) {
+      lockHoldCount++;
+      if (lockHoldCount >= dpll::getLockHoldCycles()) {
+        s_dpllState = STATE_LOCKED;
         if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
           DebugPort.printf("[DPLL LOCKED] Freq = %.1f Hz | Phase = %.1f ns\n",
                            controlOutput, filteredPhaseNs);
@@ -843,18 +888,20 @@ void processDPLL()
           DebugPort.printf("[DPLL LOCKED] DAC = %.3f V | Freq = %.1f Hz | Phase = %.1f ns\n",
                            controlOutput, data.frequencyHz, filteredPhaseNs);
         }
+        dpll::setLockedCenter(controlOutput);
       }
-    }
-  } else {
-    lockHoldCount = 0;
-    if (state == STATE_LOCKED) {
-      state = STATE_TRACKING;
-      DebugPort.printf("[DPLL UNLOCKED] Phase Error = %.1f ns\n", filteredPhaseNs);
+    } else {
+      lockHoldCount = 0;
     }
   }
 
-  // Update hardware lock indicator LED (active high)
-  digitalWriteFast(digitalPinToPinName(LOCK_INDICATOR_LED), (state == STATE_LOCKED) ? HIGH : LOW);
+  // Update hardware lock indicator LED (active high with 500 ms pulse-stretcher)
+  if (s_dpllState == STATE_LOCKED) {
+    s_lastLockMs = nowMs;
+    digitalWrite(LOCK_INDICATOR_LED, HIGH);
+  } else if (nowMs - s_lastLockMs >= 500U) {
+    digitalWrite(LOCK_INDICATOR_LED, LOW);
+  }
 
   phase_capture::clearWindowData();
   lastDacUpdate = millis();
@@ -1048,6 +1095,23 @@ void handleDebugCommand(const String &cmd)
       dpll::setLockMemoryTimeoutMs(v);
       DebugPort.printf("Lock memory timeout = %u ms%s\n", v,
                        v == 0 ? " (never expire)" : "");
+    }
+  }
+  else if (name == "led")
+  {
+    if (arg == "on" || arg == "1")
+    {
+      digitalWrite(LOCK_INDICATOR_LED, HIGH);
+      DebugPort.println(F("LOCK LED (PC10) set to HIGH (ON)"));
+    }
+    else if (arg == "off" || arg == "0")
+    {
+      digitalWrite(LOCK_INDICATOR_LED, LOW);
+      DebugPort.println(F("LOCK LED (PC10) set to LOW (OFF)"));
+    }
+    else
+    {
+      DebugPort.println(F("Usage: led on | led off"));
     }
   }
   else if (name == "eeprom")
@@ -1544,6 +1608,6 @@ void heartbeat()
   if (currentTime - lastToggleTime >= 500)
   {
     lastToggleTime = currentTime;
-    digitalToggleFast(digitalPinToPinName(HEARTBEAT_LED));
+    digitalToggle(HEARTBEAT_LED);
   }
 }

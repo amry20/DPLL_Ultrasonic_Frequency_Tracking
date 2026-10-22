@@ -30,7 +30,7 @@ float s_ddsKi = 0.1f;
 float s_ddsKd = 0.0f;
 
 float s_centerVoltage = 1.65f;
-float s_targetPhaseNs = 0.0f;
+float s_targetPhaseNs = 600.0f;
 
 float s_lastError = 0.0f;
 bool  s_haveLastError = false;
@@ -57,7 +57,7 @@ float    s_lockThresholdNs   = 500.0f;
 bool     s_manualMode        = false;
 float    s_lockedCenterV     = 1.65f;
 bool     s_haveLockedCenter  = false;
-uint32_t s_lockHoldCycles    = 10;
+uint32_t s_lockHoldCycles    = 2;
 uint32_t s_streamPeriodMs    = 10;   // monitor stream rate (ms); 10 ms = 100 Hz fixed
 
 SignalLossBehavior s_signalLossBehavior = SIGNAL_LOSS_FREEZE;
@@ -316,11 +316,19 @@ float update(float phaseErrorNs, float dtSeconds)
     error = -error;
   }
 
+  // Integral Deadband: When phase error is very close to target (<= 30 ns), freeze
+  // integral accumulation to prevent hunting/creep. Full integral action is active
+  // whenever phase is outside 30 ns so it quickly pulls phase right to the target!
+  float intError = error;
+  if (fabsf(error) <= 30.0f) {
+    intError = 0.0f;
+  }
+
   if (s_generatorSource == GENERATOR_SOURCE_DDS)
   {
     // --- Direct DDS Frequency Tracking (Continuous Incremental Form: f_new = f_curr ± Δf) ---
     float deltaProp = s_ddsKp * error;
-    float deltaInt  = s_ddsKi * error * dtSeconds;
+    float deltaInt  = s_ddsKi * intError * dtSeconds;
 
     float derivative = 0.0f;
     if (s_haveLastError) {
@@ -359,7 +367,7 @@ float update(float phaseErrorNs, float dtSeconds)
   {
     // --- External VCO DAC Voltage Tracking (Continuous Incremental Form: V_new = V_curr ± ΔV) ---
     float deltaProp = s_dacKp * error;
-    float deltaInt  = s_dacKi * error * dtSeconds;
+    float deltaInt  = s_dacKi * intError * dtSeconds;
 
     float derivative = 0.0f;
     if (s_haveLastError) {
@@ -396,7 +404,7 @@ float update(float phaseErrorNs, float dtSeconds)
 
 float lastVoltage()
 {
-  return s_outputVoltage;
+  return (s_generatorSource == GENERATOR_SOURCE_DAC) ? (dac::lastRaw() * (3.3f / 4095.0f)) : s_outputVoltage;
 }
 
 void shutdown()
