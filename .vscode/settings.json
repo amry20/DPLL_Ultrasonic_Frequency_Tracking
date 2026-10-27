@@ -5,5 +5,8 @@
     // Ctrl+Click -> Go to Definition here.
     "C_Cpp.intelliSenseEngine": "default",
     // Disable Python language server since this is an embedded C/C++ project
-    "python.languageServer": "None"
+    "python.languageServer": "None",
+    "clangd.arguments": [
+        "--query-driver=**/*arm-none-eabi*"
+    ]
 }

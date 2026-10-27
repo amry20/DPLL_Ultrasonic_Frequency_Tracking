@@ -568,6 +568,9 @@ enum DpllState : uint8_t {
 };
 static DpllState s_dpllState = STATE_NO_SIGNAL;
 static phase_capture::CaptureData s_latestCaptureData{};
+static float s_latestFilteredPhaseNs = 0.0f;
+static bool  s_haveFilteredPhase     = false;
+static float s_holdPhaseNs           = 0.0f;
 
 // Fixed-rate monitor stream — runs independently of the settling window.
 // Rate is set by dpll::getStreamPeriodMs() (default 100 ms = 10 Hz).
@@ -590,11 +593,20 @@ void sendMonitorStream()
   const bool isSignalActive = (s_dpllState != STATE_NO_SIGNAL);
   const bool isPhaseValid   = isSignalActive && data.valid;
 
-  // Phase value reported while ZCD/REF is absent.
-  // Updated ONLY while signal is actively being tracked or locked.
-  static float s_holdPhaseNs = 0.0f;
+  // Phase value reported: prefer robust filtered window phase when active.
+  float currentPhaseNs = 0.0f;
   if (isPhaseValid) {
-    s_holdPhaseNs = data.phaseDiffNs;
+    if (s_haveFilteredPhase) {
+      currentPhaseNs = s_latestFilteredPhaseNs;
+    } else {
+      currentPhaseNs = data.phaseDiffNs;
+    }
+    // Update hold phase ONLY when signal is healthy and sane (exclude wild dying spikes > 3000 ns)
+    if (fabsf(currentPhaseNs) < 3000.0f) {
+      s_holdPhaseNs = currentPhaseNs;
+    }
+  } else {
+    currentPhaseNs = s_holdPhaseNs;
   }
 
   dpllStatusData status;
@@ -611,7 +623,7 @@ void sendMonitorStream()
     status.LockStatus = 2;
   }
   status.ReferenceFrequencyHz = data.frequencyHz;
-  status.PhaseError_ns        = isPhaseValid ? data.phaseDiffNs : s_holdPhaseNs;
+  status.PhaseError_ns        = currentPhaseNs;
   status.PhaseStale           = isPhaseValid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
 
@@ -774,6 +786,12 @@ void processDPLL()
     s_dpllState = STATE_NO_SIGNAL;
     glitchSkipCount = 0;
     if (wasActive) {
+      // Hold clean locked phase during idle, completely shielding telemetry
+      // from the dying pulse-end transient (e.g. 4900 ns spike).
+      if (s_lockedThisPulse && s_lastGoodPhase != 0.0f) {
+        s_holdPhaseNs = s_lastGoodPhase;
+      }
+
       // Commit a clean locked centre (excludes the pulse-end transient).
       float cleanV;
       if (s_lockedThisPulse && lockHistPick(cleanV)) {
@@ -800,6 +818,7 @@ void processDPLL()
       }
       lockHistClear();
     }
+    s_haveFilteredPhase = false;
     s_goodCount = 0;
     lockMissCount = 0;
     s_lockedThisPulse = false;
@@ -872,6 +891,7 @@ void processDPLL()
     unlockHoldCount = 0;
     railClampCount = 0;
     trackCycles = 0;
+    s_haveFilteredPhase = false;
     phase_capture::resetFilterState();
   }
 
@@ -968,6 +988,8 @@ void processDPLL()
   float controlOutput = dpll::update(filteredPhaseNs, dt);
   trackCycles++;
   s_lastGoodPhase = filteredPhaseNs;
+  s_latestFilteredPhaseNs = filteredPhaseNs;
+  s_haveFilteredPhase = true;
   if (s_goodCount < 255) s_goodCount++;
   if (s_dpllState == STATE_LOCKED && !usedFallback) {
     lockHistPush(nowMs, controlOutput); // Only record verified locked operating points

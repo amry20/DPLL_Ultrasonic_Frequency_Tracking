@@ -1,0 +1,16 @@
+CompileFlags:
+  Add:
+    - -DGCC_VERSION=120301
+    - -fgnuc-version=12.3.1
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/arm-none-eabi/include/c++/12.3.1
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/arm-none-eabi/include/c++/12.3.1/arm-none-eabi/thumb/v7e-m+fp/hard
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/arm-none-eabi/include/c++/12.3.1/backward
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/lib/gcc/arm-none-eabi/12.3.1/include
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/lib/gcc/arm-none-eabi/12.3.1/include-fixed
+    - -isystem
+    - C:/Users/Formulatrix/.platformio/packages/toolchain-gccarmnoneeabi/arm-none-eabi/include

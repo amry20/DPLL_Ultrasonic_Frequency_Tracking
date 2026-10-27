@@ -31,6 +31,9 @@ volatile uint32_t s_zcdCount       = 0;
 volatile uint32_t s_lastZcdMs      = 0;
 volatile uint32_t s_lastRefMs      = 0;
 volatile bool     s_refValid       = false;
+volatile int32_t  s_lastSynchronizedDiff = 0;
+volatile bool     s_haveSynchronizedDiff = false;
+volatile uint8_t  s_zcdStartupEdges      = 0;
 
 uint32_t s_zcdTimeoutMs = 50;
 uint32_t s_refTimeoutMs = 100;
@@ -145,6 +148,10 @@ void storePhaseSampleFromIsr(uint32_t zcdCapture)
   while (diff > halfPeriod) diff -= period;
   while (diff < -halfPeriod) diff += period;
 
+  // Save atomically paired difference for instant snapshot reads in getData()
+  s_lastSynchronizedDiff = diff;
+  s_haveSynchronizedDiff = true;
+
   const uint8_t bank = s_activeBank;
   const uint16_t index = s_bankCount[bank];
   if (index >= kMaxWindowSamples) {
@@ -186,9 +193,24 @@ void onRefCapture()
 // ISR Callback for Channel 2 (ZCD pin)
 void onZcdCapture()
 {
-  s_lastZcdCapture = s_timer->getCaptureCompare(2);
-  s_lastZcdMs      = millis();
+  uint32_t cap = s_timer->getCaptureCompare(2);
+  uint32_t nowMs = millis();
+
+  // Fresh onset detection: if ZCD was absent longer than timeout, reset startup edge blanking
+  if (s_lastZcdMs == 0 || (nowMs - s_lastZcdMs) > s_zcdTimeoutMs) {
+    s_zcdStartupEdges = 0;
+  }
+
+  s_lastZcdCapture = cap;
+  s_lastZcdMs      = nowMs;
   s_zcdCount++;
+
+  // Discard the first 4 edges (~120 us) at onset to shield buffer from FET switching transients
+  if (s_zcdStartupEdges < 4) {
+    s_zcdStartupEdges++;
+    return;
+  }
+
   storePhaseSampleFromIsr(s_lastZcdCapture);
 }
 
@@ -286,6 +308,8 @@ CaptureData getData()
   uint32_t lastZcdMs = 0;
   uint32_t lastRefMs = 0;
   uint32_t nowTicks  = 0;
+  int32_t  syncDiff  = 0;
+  bool     haveSync  = false;
 
   // Atomic snapshot of ISR variables
   noInterrupts();
@@ -298,6 +322,8 @@ CaptureData getData()
   out.refValid        = s_refValid;
   lastZcdMs           = s_lastZcdMs;
   lastRefMs           = s_lastRefMs;
+  syncDiff            = s_lastSynchronizedDiff;
+  haveSync            = s_haveSynchronizedDiff;
   interrupts();
 
   uint32_t now = millis();
@@ -348,15 +374,19 @@ CaptureData getData()
     return out;
   }
 
-  // 1) Raw time difference: ZCD timestamp relative to REF timestamp
-  int32_t diff = static_cast<int32_t>(out.zcdTimestamp - out.refTimestamp);
-  int32_t halfPeriod = static_cast<int32_t>(out.periodTicks / 2);
-  // 3) Wrap difference to range [-periodTicks/2 .. +periodTicks/2]
-  while (diff > halfPeriod) {
-    diff -= static_cast<int32_t>(out.periodTicks);
-  }
-  while (diff < -halfPeriod) {
-    diff += static_cast<int32_t>(out.periodTicks);
+  // Use cycle-synchronized difference if available; fallback to raw timestamp delta
+  int32_t diff = 0;
+  if (haveSync) {
+    diff = syncDiff;
+  } else {
+    diff = static_cast<int32_t>(out.zcdTimestamp - out.refTimestamp);
+    int32_t halfPeriod = static_cast<int32_t>(out.periodTicks / 2);
+    while (diff > halfPeriod) {
+      diff -= static_cast<int32_t>(out.periodTicks);
+    }
+    while (diff < -halfPeriod) {
+      diff += static_cast<int32_t>(out.periodTicks);
+    }
   }
 
   out.phaseDiffTicks = diff;
@@ -632,6 +662,8 @@ void resetFilterState()
   s_haveShiftCandidate = false;
   s_shiftCandidateSinceMs = 0;
   s_lastTrustedPhaseDeg = 0.0f;
+  s_haveSynchronizedDiff = false;
+  s_zcdStartupEdges = 0;
 }
 
 float ticksToUs(uint32_t ticks)
