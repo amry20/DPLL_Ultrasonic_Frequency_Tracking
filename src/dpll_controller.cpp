@@ -524,10 +524,13 @@ void tickSignalAbsent(uint32_t nowMs)
     s_signalAbsentSince = nowMs;
     s_signalWasAbsent   = true;
   }
-  if (s_lockMemoryTimeoutMs > 0 && s_haveLockedCenter) {
+  if (s_lockMemoryTimeoutMs > 0) {
     if ((nowMs - s_signalAbsentSince) >= s_lockMemoryTimeoutMs) {
       s_haveLockedCenter = false;
       s_lockedCenterV    = s_centerVoltage;
+      if (s_signalLossBehavior == SIGNAL_LOSS_FREEZE) {
+        reset();
+      }
     }
   }
 

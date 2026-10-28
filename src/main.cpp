@@ -594,23 +594,34 @@ void sendMonitorStream()
   const bool isPhaseValid   = isSignalActive && data.valid;
 
   // Phase value reported: prefer robust filtered window phase when active.
-  float currentPhaseNs = 0.0f;
+  // When idle or at start-up settling, hold clean locked phase (or targetPhase) instead of collapsing to 0 ns.
+  const float targetPhase = dpll::getTargetPhase();
+  const float holdPhase = (s_holdPhaseNs != 0.0f) ? s_holdPhaseNs : targetPhase;
+  float currentPhaseNs = holdPhase;
   if (isPhaseValid) {
     if (s_haveFilteredPhase) {
       currentPhaseNs = s_latestFilteredPhaseNs;
+      // Update hold phase ONLY when signal is healthy and sane (exclude wild dying spikes > 3000 ns).
+      // When locked, also reject sudden large jumps (> 600 ns) from corrupting the hold phase.
+      bool saneHold = (fabsf(currentPhaseNs) < 3000.0f);
+      if (s_dpllState == STATE_LOCKED && s_holdPhaseNs != 0.0f) {
+        if (fabsf(currentPhaseNs - s_holdPhaseNs) > 600.0f) {
+          saneHold = false;
+        }
+      }
+      if (saneHold) {
+        s_holdPhaseNs = currentPhaseNs;
+      }
     } else {
-      currentPhaseNs = data.phaseDiffNs;
-    }
-    // Update hold phase ONLY when signal is healthy and sane (exclude wild dying spikes > 3000 ns)
-    if (fabsf(currentPhaseNs) < 3000.0f) {
-      s_holdPhaseNs = currentPhaseNs;
+      // At pulse onset while filter window is settling, hold clean phase to shield telemetry
+      currentPhaseNs = holdPhase;
     }
   } else {
-    currentPhaseNs = s_holdPhaseNs;
+    currentPhaseNs = holdPhase;
   }
 
   dpllStatusData status;
-  // LockStatus: 0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
+  // LockStatus: 0=NO_REF, 1=WAIT_ZCD/ACQUIRING, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
   if (dpll::getManualMode()) {
     status.LockStatus = 4;
   } else if (!data.refValid) {
@@ -659,25 +670,25 @@ void sendMonitorStream()
 namespace {
 constexpr uint8_t  kLockHistSize    = 32;
 constexpr uint32_t kLockHistGuardMs = 20;
-struct LockSample { uint32_t ms; float v; };
+struct LockSample { uint32_t ms; float v; float phaseNs; };
 LockSample s_lockHist[kLockHistSize];
 uint8_t    s_lockHistCount = 0;
 uint8_t    s_lockHistHead  = 0; // next write index
 
 void lockHistClear() { s_lockHistCount = 0; s_lockHistHead = 0; }
 
-void lockHistPush(uint32_t ms, float v)
+void lockHistPush(uint32_t ms, float v, float phaseNs)
 {
-  s_lockHist[s_lockHistHead] = { ms, v };
+  s_lockHist[s_lockHistHead] = { ms, v, phaseNs };
   s_lockHistHead = (uint8_t)((s_lockHistHead + 1) % kLockHistSize);
   if (s_lockHistCount < kLockHistSize) s_lockHistCount++;
 }
 
 // Pick newest entry that is >= guard older than the newest one; fall back to
-// the oldest stored entry. Requires at least 3 samples to avoid single-cycle glitches.
-bool lockHistPick(float &v)
+// the oldest stored entry. Requires at least 1 sample.
+bool lockHistPick(float &v, float &phaseNs)
 {
-  if (s_lockHistCount < 3) return false;
+  if (s_lockHistCount == 0) return false;
   const uint8_t newestIdx = (uint8_t)((s_lockHistHead + kLockHistSize - 1) % kLockHistSize);
   const uint32_t newestMs = s_lockHist[newestIdx].ms;
   uint8_t idx = newestIdx;
@@ -685,10 +696,12 @@ bool lockHistPick(float &v)
     idx = (uint8_t)((newestIdx + kLockHistSize - i) % kLockHistSize);
     if ((uint32_t)(newestMs - s_lockHist[idx].ms) >= kLockHistGuardMs) {
       v = s_lockHist[idx].v;
+      phaseNs = s_lockHist[idx].phaseNs;
       return true;
     }
   }
   v = s_lockHist[idx].v; // oldest entry
+  phaseNs = s_lockHist[idx].phaseNs;
   return true;
 }
 } // namespace
@@ -732,8 +745,11 @@ void processDPLL()
     float candidate = fallbackV;
     if (dpll::haveLockedCenter()) {
       candidate = dpll::getLockedCenterV();
-    } else if (s_haveParkV) {
-      candidate = s_parkV;
+    } else {
+      s_haveParkV = false;
+      candidate = (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+                ? dpll::getDdsCenterFreq()
+                : dpll::getCenterVoltage();
     }
 
     if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
@@ -743,7 +759,7 @@ void processDPLL()
       }
     } else {
       const float centerV = dpll::getCenterVoltage();
-      if (candidate < 1.50f || fabsf(candidate - centerV) > 0.22f) {
+      if (candidate < 0.20f || candidate > 3.10f || fabsf(candidate - centerV) > 0.80f) {
         return centerV;
       }
     }
@@ -786,20 +802,18 @@ void processDPLL()
     s_dpllState = STATE_NO_SIGNAL;
     glitchSkipCount = 0;
     if (wasActive) {
-      // Hold clean locked phase during idle, completely shielding telemetry
-      // from the dying pulse-end transient (e.g. 4900 ns spike).
-      if (s_lockedThisPulse && s_lastGoodPhase != 0.0f) {
-        s_holdPhaseNs = s_lastGoodPhase;
-      }
-
-      // Commit a clean locked centre (excludes the pulse-end transient).
+      // Commit clean locked centre and locked phase guarded against the dying pulse-end transient.
       float cleanV;
-      if (s_lockedThisPulse && lockHistPick(cleanV)) {
+      float cleanPhase;
+      if (s_lockedThisPulse && lockHistPick(cleanV, cleanPhase)) {
+        s_holdPhaseNs = cleanPhase;
+        s_lastGoodPhase = cleanPhase;
+
         bool isSane = false;
         if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
-          isSane = (fabsf(cleanV - dpll::getDdsCenterFreq()) <= 1500.0f);
+          isSane = (cleanV >= dpll::getDdsMinFreq() && cleanV <= dpll::getDdsMaxFreq());
         } else {
-          isSane = (cleanV >= 1.50f && fabsf(cleanV - dpll::getCenterVoltage()) <= 0.22f);
+          isSane = (cleanV >= 0.20f && cleanV <= 3.10f && fabsf(cleanV - dpll::getCenterVoltage()) <= 0.80f);
         }
 
         if (isSane) {
@@ -810,11 +824,13 @@ void processDPLL()
           s_haveParkV = false;
           dpll::clearLockedCenter();
         }
-      } else if (!s_lockedThisPulse) {
-        // If the pulse ended without a valid lock, discard previous park value
-        // and reset locked center to avoid dragging bad tracking into next pulse.
+      } else if (!dpll::haveLockedCenter()) {
+        // Only reset if no valid lock memory exists from this or previous pulses
         s_haveParkV = false;
         dpll::clearLockedCenter();
+        dpll::reset();
+        s_holdPhaseNs = dpll::getTargetPhase();
+        s_lastGoodPhase = dpll::getTargetPhase();
       }
       lockHistClear();
     }
@@ -830,6 +846,16 @@ void processDPLL()
     railClampCount = 0;
     trackCycles = 0;
 
+    const bool wasLockedCenter = dpll::haveLockedCenter();
+    dpll::tickSignalAbsent(nowMs);
+    if (wasLockedCenter && !dpll::haveLockedCenter()) {
+      s_haveParkV = false;
+      s_holdPhaseNs = dpll::getTargetPhase();
+      s_lastGoodPhase = dpll::getTargetPhase();
+      DebugPort.printf("[DPLL] Lock memory expired (> %u ms absent) -> Reset to center\n",
+                       dpll::getLockMemoryTimeoutMs());
+    }
+
     switch (dpll::getSignalLossBehavior())
     {
       case dpll::SIGNAL_LOSS_CENTER:
@@ -841,19 +867,21 @@ void processDPLL()
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        if (dpll::haveLockedCenter() || s_haveParkV) {
-          // Park at the confirmed operating point near resonance.
+        if (dpll::haveLockedCenter() && s_haveParkV) {
+          // Park at the confirmed operating point near resonance while lock memory is valid.
           const float parkV = restartValue(dpll::getCenterVoltage());
           if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
             dpll::restartAtFrequency(parkV);
           } else {
             dpll::restartAtVoltage(parkV);
           }
+        } else {
+          // Lock memory expired (or pulse never locked): revert directly to neutral center!
+          dpll::reset();
         }
         dpll::enable(false); // Hold last locked voltage / frequency
         break;
     }
-    dpll::tickSignalAbsent(nowMs);
     phase_capture::clearWindowData();
     phase_capture::resetFilterState(); // Prepare filter for immediate acceptance on next pulse
     lastDacUpdate = millis();
@@ -865,17 +893,17 @@ void processDPLL()
 
   // State Transition & Re-acquisition logic
   if (s_dpllState == STATE_NO_SIGNAL) {
-    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER) {
+    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER || !dpll::haveLockedCenter()) {
       dpll::reset();
       DebugPort.printf("[DPLL] Re-acquire: reset to center\n");
     } else {
       // FREEZE / Resume: start exactly from the locked center point
       if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
-        float resumeF = restartValue(dpll::lastFrequency());
+        float resumeF = restartValue(dpll::getDdsCenterFreq());
         dpll::restartAtFrequency(resumeF);
         DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", resumeF);
       } else {
-        float resumeV = restartValue(dpll::lastVoltage());
+        float resumeV = restartValue(dpll::getCenterVoltage());
         dpll::restartAtVoltage(resumeV);
         DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", resumeV, data.frequencyHz);
       }
@@ -896,9 +924,10 @@ void processDPLL()
   }
 
   // Ignore the start-up transient windows of each pulse (no PID update).
-  // 3 windows = 30 ms, allowing mechanical ring-up under swab/viscous loading
-  // to settle before active PI steering.
-  if (settleCycles < 3) {
+  // Transducer acoustic ring-up: wait ~15-20 ms regardless of loop period.
+  const uint32_t maxSettleCycles = (dpll::getLoopPeriodMs() >= 20U) ? 1U :
+                                   ((20U + dpll::getLoopPeriodMs() - 1U) / dpll::getLoopPeriodMs());
+  if (settleCycles < maxSettleCycles) {
     settleCycles++;
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
@@ -919,7 +948,7 @@ void processDPLL()
     // PID keeps tracking. Lock is never declared from a fallback window.
     const float halfPeriodNs = (data.frequencyHz > 1.0f) ? (0.5e9f / data.frequencyHz) : 15000.0f;
     float fb = window.phaseComputed ? window.phaseDiffNs : data.phaseDiffNs;
-    const bool usable = !window.overflow && (window.sampleCount >= 2) &&
+    const bool usable = (window.sampleCount >= 2) &&
                         fabsf(fb) < (0.8f * halfPeriodNs);
     static uint32_t lastFilterLogMs = 0;
     if (nowMs - lastFilterLogMs >= 500U) {
@@ -961,18 +990,23 @@ void processDPLL()
   // ZCD at the end of a sonication pulse. Do not let it move the DAC.
   // A persistent step (>= 4 cycles) is accepted as real.
   {
-    // Independent of lock state: compare with the last accepted window
-    // (or the target while no history exists in this pulse).
+    // Glitch guard: reject dying pulse transient and start-up acoustic transient.
+    // A persistent step (>= 4 cycles) is accepted as real.
     const bool haveGood = (s_goodCount >= 2);
-    const float kJumpThr = fmaxf(1.5f * kLockThr, 1000.0f);
+    const float kJumpThr = (s_dpllState == STATE_LOCKED)
+                         ? fmaxf(1.5f * kLockThr, 600.0f)
+                         : fmaxf(2.0f * kLockThr, 1000.0f);
     bool glitch = false;
     if (haveGood) {
       glitch = fabsf(filteredPhaseNs - s_lastGoodPhase) > kJumpThr;
     } else {
-      // Pulse start: an untrusted window far from target is the transducer
-      // start-up transient, not a usable error.
-      glitch = usedFallback &&
-               fabsf(filteredPhaseNs - dpll::getTargetPhase()) > fmaxf(4.0f * kLockThr, 2500.0f);
+      // Pulse start: compare with last good phase (or target) to reject start-up acoustic transient.
+      // If resuming from a confirmed locked operating point, start phase should be close to reference.
+      const float refPhase = (s_lastGoodPhase != 0.0f) ? s_lastGoodPhase : dpll::getTargetPhase();
+      const float kStartGate = dpll::haveLockedCenter()
+                             ? fmaxf(1.5f * kLockThr, 600.0f)
+                             : fmaxf(2.5f * kLockThr, 1200.0f);
+      glitch = fabsf(filteredPhaseNs - refPhase) > kStartGate;
     }
     if (glitch && glitchSkipCount < 4) {
       glitchSkipCount++;
@@ -992,7 +1026,7 @@ void processDPLL()
   s_haveFilteredPhase = true;
   if (s_goodCount < 255) s_goodCount++;
   if (s_dpllState == STATE_LOCKED && !usedFallback) {
-    lockHistPush(nowMs, controlOutput); // Only record verified locked operating points
+    lockHistPush(nowMs, controlOutput, filteredPhaseNs); // Only record verified locked operating points
   }
 
   // Check if controller is pinned to rails:
@@ -1052,13 +1086,14 @@ void processDPLL()
       unlockHoldCount = 0;
     }
   } else {
-    // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold (minimum 3 cycles)
+    // Currently TRACKING: require lockHoldCycles consecutive cycles within lock threshold
     unlockHoldCount = 0;
     if (withinLockWindow) {
       lockMissCount = 0;
       lockHoldCount++;
       const uint32_t configuredHold = dpll::getLockHoldCycles();
-      const uint32_t holdNeed = (configuredHold < 3) ? 3 :
+      const uint32_t minHold = (dpll::getLoopPeriodMs() >= 20U) ? 1U : 2U;
+      const uint32_t holdNeed = (configuredHold < minHold) ? minHold :
                               (configuredHold > kMaxEffectiveHold ? kMaxEffectiveHold : configuredHold);
       if (lockHoldCount >= holdNeed) {
         s_dpllState = STATE_LOCKED;

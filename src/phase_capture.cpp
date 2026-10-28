@@ -29,6 +29,7 @@ volatile uint32_t s_periodTicks    = 0;
 volatile uint32_t s_captureCount   = 0;
 volatile uint32_t s_zcdCount       = 0;
 volatile uint32_t s_lastZcdMs      = 0;
+volatile uint32_t s_lastRawZcdMs   = 0;
 volatile uint32_t s_lastRefMs      = 0;
 volatile bool     s_refValid       = false;
 volatile int32_t  s_lastSynchronizedDiff = 0;
@@ -50,11 +51,10 @@ constexpr uint32_t kStableRefFreshMs = 200U;
 
 constexpr float kTimerClockHz = 84000000.0f; // 84 MHz APB1 timer clock on STM32F407
 
-// At 35 kHz a 20 ms window contains about 700 samples. 1024 leaves headroom
-// without using dynamic allocation. If a longer runtime-configured loop period
-// overflows the bank, that window is rejected rather than silently truncated.
-constexpr size_t kMaxWindowSamples = 1024;
-constexpr size_t kMaxBlockSize     = 32;
+// At 35 kHz a 40 ms window contains about 1400 samples. 1536 leaves headroom
+// for long loop periods without dynamic allocation.
+constexpr size_t kMaxWindowSamples = 1536;
+constexpr size_t kMaxBlockSize     = 48;
 constexpr size_t kMinBlockSize     = 4;
 constexpr size_t kTargetBlockCount = 8;
 constexpr size_t kMaxBlocks        = 32;
@@ -196,20 +196,22 @@ void onZcdCapture()
   uint32_t cap = s_timer->getCaptureCompare(2);
   uint32_t nowMs = millis();
 
-  // Fresh onset detection: if ZCD was absent longer than timeout, reset startup edge blanking
-  if (s_lastZcdMs == 0 || (nowMs - s_lastZcdMs) > s_zcdTimeoutMs) {
+  // Fresh onset detection: if raw ZCD edges were absent longer than timeout, reset startup edge counter
+  if ((nowMs - s_lastRawZcdMs) > s_zcdTimeoutMs) {
     s_zcdStartupEdges = 0;
+  }
+  s_lastRawZcdMs = nowMs;
+
+  // Discard the first 8 edges (~200 us at 40 kHz) at onset to shield buffer
+  // from FET switching transients and initial transformer capacitive spikes.
+  if (s_zcdStartupEdges < 8) {
+    s_zcdStartupEdges++;
+    return;
   }
 
   s_lastZcdCapture = cap;
   s_lastZcdMs      = nowMs;
   s_zcdCount++;
-
-  // Discard the first 4 edges (~120 us) at onset to shield buffer from FET switching transients
-  if (s_zcdStartupEdges < 4) {
-    s_zcdStartupEdges++;
-    return;
-  }
 
   storePhaseSampleFromIsr(s_lastZcdCapture);
 }
@@ -250,6 +252,7 @@ void begin(uint32_t refPin, uint32_t zcdPin, EdgePolarity refEdge, EdgePolarity 
   s_zcdCount     = 0;
   s_refValid     = false;
   s_lastZcdMs    = 0;
+  s_lastRawZcdMs = 0;
   s_lastRefMs    = 0;
   s_activeBank   = 0;
   s_bankCount[0] = 0;
@@ -374,21 +377,16 @@ CaptureData getData()
     return out;
   }
 
-  // Use cycle-synchronized difference if available; fallback to raw timestamp delta
-  int32_t diff = 0;
-  if (haveSync) {
-    diff = syncDiff;
-  } else {
-    diff = static_cast<int32_t>(out.zcdTimestamp - out.refTimestamp);
-    int32_t halfPeriod = static_cast<int32_t>(out.periodTicks / 2);
-    while (diff > halfPeriod) {
-      diff -= static_cast<int32_t>(out.periodTicks);
-    }
-    while (diff < -halfPeriod) {
-      diff += static_cast<int32_t>(out.periodTicks);
-    }
+  // Only use cycle-synchronized difference. Never fall back to raw asynchronous
+  // timestamp subtraction at pulse onset which creates false microsecond spikes!
+  if (!haveSync) {
+    out.valid          = false;
+    out.phaseDiffTicks = 0;
+    out.phaseDiffNs    = 0.0f;
+    return out;
   }
 
+  int32_t diff = syncDiff;
   out.phaseDiffTicks = diff;
 
   // 3) Convert phase diff to nanoseconds (time delay ZCD vs REF).
@@ -601,7 +599,9 @@ PhaseWindowData consumeWindowData()
   result.phaseDiffNs = (endpointDeg / 360.0f) * periodNs;
   result.phaseComputed = true;
 
-  bool locallyTrustworthy = !overflow &&
+  // Window is trustworthy if sample count and fit metrics pass. Reaching buffer
+  // capacity on long loop periods (overflow) does not invalidate the captured samples.
+  bool locallyTrustworthy =
       sampleCount >= kMinWindowSamples &&
       acceptedBlocks >= kMinAcceptedBlocks &&
       (1.0f - result.outlierRatio) >= kMinAcceptedRatio &&
@@ -664,6 +664,7 @@ void resetFilterState()
   s_lastTrustedPhaseDeg = 0.0f;
   s_haveSynchronizedDiff = false;
   s_zcdStartupEdges = 0;
+  s_lastRawZcdMs = 0;
 }
 
 float ticksToUs(uint32_t ticks)
