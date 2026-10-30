@@ -36,6 +36,13 @@ volatile int32_t  s_lastSynchronizedDiff = 0;
 volatile bool     s_haveSynchronizedDiff = false;
 volatile uint8_t  s_zcdStartupEdges      = 0;
 
+// 64-cycle running accumulator for high-precision, zero-dither period & frequency measurement
+constexpr uint8_t kRefAvgCycles = 64;
+static uint32_t   s_refCapHistory[kRefAvgCycles] = {0};
+static uint8_t    s_refCapHead = 0;
+static uint8_t    s_refAvgCount = 0;
+volatile uint32_t s_totalPeriodTicks64 = 0;
+
 uint32_t s_zcdTimeoutMs = 50;
 uint32_t s_refTimeoutMs = 100;
 
@@ -179,6 +186,16 @@ TimerModes_t toTimerMode(EdgePolarity edge)
 void onRefCapture()
 {
   uint32_t cap = s_timer->getCaptureCompare(1);
+  uint32_t nowMs = millis();
+
+  // If signal was absent longer than timeout, reset history to avoid cross-pulse subtraction
+  if (s_lastRefMs > 0 && (nowMs - s_lastRefMs) > s_refTimeoutMs) {
+    s_captureCount       = 0;
+    s_refAvgCount        = 0;
+    s_refCapHead         = 0;
+    s_totalPeriodTicks64 = 0;
+  }
+
   uint32_t delta = cap - s_lastRefCapture;
 
   // Minimum period guard: At 84 MHz, 100 kHz is 840 ticks. 500 kHz is 168 ticks.
@@ -190,11 +207,25 @@ void onRefCapture()
 
   s_prevRefCapture = s_lastRefCapture;
   s_lastRefCapture = cap;
-  s_lastRefMs      = millis();
+  s_lastRefMs      = nowMs;
 
   if (s_captureCount > 0) {
-    s_periodTicks = delta; // Handles 32-bit overflow automatically
-    s_refValid = (s_periodTicks > 0);
+    if (s_refAvgCount < kRefAvgCycles) {
+      s_refCapHistory[s_refCapHead] = cap;
+      s_refCapHead = (s_refCapHead + 1) & (kRefAvgCycles - 1);
+      s_refAvgCount++;
+      s_periodTicks        = delta;
+      s_totalPeriodTicks64 = delta * kRefAvgCycles;
+      s_refValid           = (s_periodTicks > 0);
+    } else {
+      uint32_t oldCap = s_refCapHistory[s_refCapHead];
+      s_refCapHistory[s_refCapHead] = cap;
+      s_refCapHead = (s_refCapHead + 1) & (kRefAvgCycles - 1);
+      uint32_t spanTicks = cap - oldCap;
+      s_totalPeriodTicks64 = spanTicks;
+      s_periodTicks        = (spanTicks + (kRefAvgCycles / 2U)) >> 6;
+      s_refValid           = (s_periodTicks > 0);
+    }
   }
   s_captureCount++;
 }
@@ -266,7 +297,10 @@ void begin(uint32_t refPin, uint32_t zcdPin, EdgePolarity refEdge, EdgePolarity 
   TIM2->CCMR1 |= (3U << TIM_CCMR1_IC1F_Pos) | (3U << TIM_CCMR1_IC2F_Pos);
 
   // Reset counters and resume timer
-  s_captureCount = 0;
+  s_captureCount       = 0;
+  s_refAvgCount        = 0;
+  s_refCapHead         = 0;
+  s_totalPeriodTicks64 = 0;
   s_zcdCount     = 0;
   s_refValid     = false;
   s_lastZcdMs    = 0;
@@ -298,7 +332,10 @@ void setRefEdge(EdgePolarity edge)
 {
   s_refEdge = edge;
   s_refValid = false;
-  s_captureCount = 0;
+  s_captureCount       = 0;
+  s_refAvgCount        = 0;
+  s_refCapHead         = 0;
+  s_totalPeriodTicks64 = 0;
   if (s_timer) {
     s_timer->setMode(1, toTimerMode(s_refEdge), s_refPin);
     GPIOA->PUPDR = (GPIOA->PUPDR & ~(3U << (0 * 2))) | (2U << (0 * 2));
@@ -349,6 +386,7 @@ CaptureData getData()
   lastRefMs           = s_lastRefMs;
   syncDiff            = s_lastSynchronizedDiff;
   haveSync            = s_haveSynchronizedDiff;
+  uint32_t totalSpan  = s_totalPeriodTicks64;
   interrupts();
 
   uint32_t now = millis();
@@ -371,8 +409,12 @@ CaptureData getData()
     return out;
   }
 
-  // Frequency in Hz
-  out.frequencyHz = kTimerClockHz / static_cast<float>(out.periodTicks);
+  // Frequency in Hz: Use 64-cycle high-precision accumulator if available to eliminate dithering jitter
+  if (totalSpan > 0) {
+    out.frequencyHz = (kTimerClockHz * static_cast<float>(kRefAvgCycles)) / static_cast<float>(totalSpan);
+  } else {
+    out.frequencyHz = kTimerClockHz / static_cast<float>(out.periodTicks);
+  }
 
   // Pulse-end detection: if REF frequency abruptly jumps while ZCD is present,
   // the generator has switched to its idle frequency (+500 Hz jump) at the end of a pulse.
