@@ -119,7 +119,7 @@ namespace eeprom_config
         // Apply DDS & generator parameters first if version >= 2
         if (cfg.version >= 2)
         {
-            if (cfg.generatorSource <= 1)
+            if (cfg.generatorSource <= 2)
             {
                 dpll::setGeneratorSource((dpll::GeneratorSource)cfg.generatorSource);
             }
@@ -165,7 +165,7 @@ namespace eeprom_config
 
         dpll::begin(cfg.centerVoltage, cfg.kp, cfg.ki, cfg.kd);
         dpll::setTargetPhase(cfg.targetPhase);
-        if (cfg.version >= 2 && cfg.generatorSource == 1)
+        if (cfg.version >= 2 && (cfg.generatorSource == 1 || cfg.generatorSource == 2))
         {
             dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
         }
@@ -228,7 +228,7 @@ namespace eeprom_config
         bool ok = eraseConfig();
 
         // Restore factory baseline configuration to DPLL controller & hardware peripherals
-        dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_DAC);
+        dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
         dpll::setDdsFreqLimits(20000.0f, 40000.0f);
         dpll::setDdsMaxSlew(20000.0f);
         dpll::setDdsCenterFreq(28000.0f);

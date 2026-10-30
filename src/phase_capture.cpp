@@ -179,12 +179,21 @@ TimerModes_t toTimerMode(EdgePolarity edge)
 void onRefCapture()
 {
   uint32_t cap = s_timer->getCaptureCompare(1);
+  uint32_t delta = cap - s_lastRefCapture;
+
+  // Minimum period guard: At 84 MHz, 100 kHz is 840 ticks. 500 kHz is 168 ticks.
+  // If delta < 168 ticks (< 2 us, > 500 kHz), it's either an 8 MHz MCO clock accidentally
+  // jumpered or spurious floating noise: discard immediately to prevent CPU starvation.
+  if (s_captureCount > 0 && delta < 168U) {
+    return;
+  }
+
   s_prevRefCapture = s_lastRefCapture;
   s_lastRefCapture = cap;
   s_lastRefMs      = millis();
 
   if (s_captureCount > 0) {
-    s_periodTicks = s_lastRefCapture - s_prevRefCapture; // Handles 32-bit overflow automatically
+    s_periodTicks = delta; // Handles 32-bit overflow automatically
     s_refValid = (s_periodTicks > 0);
   }
   s_captureCount++;
@@ -247,6 +256,15 @@ void begin(uint32_t refPin, uint32_t zcdPin, EdgePolarity refEdge, EdgePolarity 
   s_timer->setMode(2, toTimerMode(s_zcdEdge), s_zcdPin);
   s_timer->attachInterrupt(2, onZcdCapture);
 
+  // Hardware protection against floating-pin interrupt storms (e.g. when IC is unplugged):
+  // 1) Enable internal pull-down on PA0 (REF) and PA1 (ZCD) so disconnected inputs stay quietly LOW (0V).
+  GPIOA->PUPDR = (GPIOA->PUPDR & ~((3U << (0 * 2)) | (3U << (1 * 2))))
+               | (2U << (0 * 2)) | (2U << (1 * 2)); // 2U = Pull-down
+
+  // 2) Configure TIM2 digital noise filter (fSAMPLING = fCK_INT, N=8) on both channels
+  //    Rejects spikes and glitches shorter than ~95 ns (frequencies > 10 MHz) at hardware level.
+  TIM2->CCMR1 |= (3U << TIM_CCMR1_IC1F_Pos) | (3U << TIM_CCMR1_IC2F_Pos);
+
   // Reset counters and resume timer
   s_captureCount = 0;
   s_zcdCount     = 0;
@@ -283,6 +301,8 @@ void setRefEdge(EdgePolarity edge)
   s_captureCount = 0;
   if (s_timer) {
     s_timer->setMode(1, toTimerMode(s_refEdge), s_refPin);
+    GPIOA->PUPDR = (GPIOA->PUPDR & ~(3U << (0 * 2))) | (2U << (0 * 2));
+    TIM2->CCMR1 |= (3U << TIM_CCMR1_IC1F_Pos);
   }
 }
 
@@ -291,6 +311,8 @@ void setZcdEdge(EdgePolarity edge)
   s_zcdEdge = edge;
   if (s_timer) {
     s_timer->setMode(2, toTimerMode(s_zcdEdge), s_zcdPin);
+    GPIOA->PUPDR = (GPIOA->PUPDR & ~(3U << (1 * 2))) | (2U << (1 * 2));
+    TIM2->CCMR1 |= (3U << TIM_CCMR1_IC2F_Pos);
   }
 }
 

@@ -1,0 +1,119 @@
+﻿STM32F407 Fine-Resolution Square Wave via DMA Dithering
+October 29, 2026
+Goal
+Generate a 30–40 kHz square wave on an STM32F407 with 1 Hz frequency resolution and zero CPU load once running. A timer plus a circular DMA buffer gets there: the hardware alternates between two neighbouring periods so the average frequency lands within a fraction of a hertz of the target.
+Why a plain timer can’t do it
+A timer in PWM mode outputs f = F_tim / ((PSC + 1) × (ARR + 1)). The divisor is an integer, so neighbouring frequencies near f are about f² / F_tim apart. PSC = 0 gives the finest steps, and that is still far coarser than 1 Hz:
+Timer clock
+	Step at 30 kHz
+	Step at 40 kHz
+	84 MHz (APB1 timers: TIM2–5, TIM12–14)
+	~10.7 Hz
+	~19 Hz
+	168 MHz (APB2 timers: TIM1, TIM8–11)
+	~5.4 Hz
+	~9.5 Hz
+	Mixing PSC and ARR does not help, because their product is still an integer.
+The method: DMA-driven period dithering
+Instead of one fixed period, the timer cycles through a buffer of N periods, each either P or P+1 timer ticks. The mix sets the average period with 1/N-tick precision, like a fractional-N synthesizer. The average step shrinks to about f² / (F_tim × N): with TIM1 at 168 MHz and N = 32, that is ~0.3 Hz at 40 kHz.
+1. Run TIM1 from the 168 MHz APB2 timer clock, PSC = 0, in PWM mode 1 on channel 1 (PA8).
+2. Enable ARR preload (ARPE), so each new period takes effect cleanly at the next update event.
+3. Fill a 32-entry RAM buffer with ARR values: k entries of P and 32 − k of P − 1, spread evenly (Bresenham-style).
+4. Let the TIM1 update event request DMA2 Stream 5 / Channel 6, which copies the next buffer entry into TIM1->ARR, in circular mode.
+5. Leave CCR1 fixed at about P/2. The one-tick period change moves the duty cycle by ~0.02%, which is invisible for a square wave.
+Once started, the timer and DMA run on their own. The CPU only touches the buffer when the frequency changes.
+Code: register-level setup
+CMSIS register names, no HAL. Assumes SystemCoreClock = 168 MHz with APB2 at 84 MHz, so TIM1 runs at 168 MHz. Output is on PA8 (TIM1_CH1).
+#include "stm32f4xx.h"
+
+#define F_TIM   168000000UL   // TIM1 clock (APB2 timer clock)
+#define N_BUF   32            // dither buffer length: avg step ~ f^2/(F_TIM*N_BUF)
+
+// One ARR value per output period. 16-bit to match TIM1->ARR.
+static volatile uint16_t arr_buf[N_BUF];
+
+// Fill the buffer so the AVERAGE period over N_BUF cycles gives frequency f.
+// Each entry is ARR = base-1 (period of base ticks) or ARR = base (base+1 ticks).
+static void fill_buf(uint32_t f)
+{
+    // Total timer ticks across N_BUF periods, rounded to nearest.
+    uint64_t total = ((uint64_t)F_TIM * N_BUF + f / 2) / f;
+    uint32_t base  = (uint32_t)(total / N_BUF);   // whole ticks per period
+    uint32_t rem   = (uint32_t)(total % N_BUF);   // how many periods get +1 tick
+    uint32_t acc   = 0;
+
+    // Bresenham-style spreading: the +1-tick periods are evenly interleaved,
+    // which keeps the short-term frequency error as small as possible.
+    for (uint32_t i = 0; i < N_BUF; i++) {
+        acc += rem;
+        if (acc >= N_BUF) { acc -= N_BUF; arr_buf[i] = base;     }  // base+1 ticks
+        else              {               arr_buf[i] = base - 1; }  // base ticks
+    }
+
+    // ~50% duty. Fixed CCR is fine: periods differ by only 1 tick.
+    TIM1->CCR1 = base / 2;
+}
+
+void sqwave_init(uint32_t f)
+{
+    // --- Clocks: GPIOA, DMA2 (AHB1) and TIM1 (APB2) ---
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_DMA2EN;
+    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+
+    // --- PA8 = TIM1_CH1: alternate function AF1, high speed ---
+    GPIOA->MODER   = (GPIOA->MODER & ~(3U << 16)) | (2U << 16);
+    GPIOA->OSPEEDR |= (3U << 16);
+    GPIOA->AFR[1]  = (GPIOA->AFR[1] & ~0xFU) | 1U;
+
+    fill_buf(f);
+
+    // --- TIM1: PWM mode 1 on CH1, no prescaler ---
+    TIM1->PSC   = 0;
+    TIM1->ARR   = arr_buf[0];
+    TIM1->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos)   // PWM mode 1
+                | TIM_CCMR1_OC1PE;            // CCR1 preload
+    TIM1->CCER  = TIM_CCER_CC1E;              // enable CH1 output
+    TIM1->BDTR  = TIM_BDTR_MOE;               // TIM1 is advanced: main output enable
+    TIM1->CR1   = TIM_CR1_ARPE;               // ARR preload: new period applies at next update
+    TIM1->EGR   = TIM_EGR_UG;                 // load preload registers now
+
+    // --- DMA2 Stream 5, Channel 6 = TIM1_UP (RM0090 DMA2 request map) ---
+    DMA2_Stream5->CR = 0;
+    while (DMA2_Stream5->CR & DMA_SxCR_EN) { }        // wait until stream is off
+    DMA2->HIFCR = 0xF40U;                             // clear all Stream 5 flags
+
+    DMA2_Stream5->PAR  = (uint32_t)&TIM1->ARR;        // destination: timer period
+    DMA2_Stream5->M0AR = (uint32_t)arr_buf;           // source: dither buffer
+    DMA2_Stream5->NDTR = N_BUF;
+    DMA2_Stream5->CR   = (6U << DMA_SxCR_CHSEL_Pos)   // channel 6
+                       | DMA_SxCR_PL_1                // high priority
+                       | DMA_SxCR_MSIZE_0             // memory: 16-bit
+                       | DMA_SxCR_PSIZE_0             // peripheral: 16-bit
+                       | DMA_SxCR_MINC                // step through buffer
+                       | DMA_SxCR_CIRC                // wrap around forever
+                       | DMA_SxCR_DIR_0;              // memory -> peripheral
+    DMA2_Stream5->CR  |= DMA_SxCR_EN;
+
+    // --- Start: each update event requests one DMA transfer into ARR ---
+    TIM1->DIER |= TIM_DIER_UDE;
+    TIM1->CR1  |= TIM_CR1_CEN;
+}
+
+// Retune at runtime: recompute the buffer while DMA keeps running.
+void sqwave_set_freq(uint32_t f)
+{
+    fill_buf(f);
+}
+Call sqwave_init(32768); to start, then sqwave_set_freq(32769); to step by 1 Hz.
+Changing frequency at runtime
+A retune costs a few microseconds of CPU: fill_buf() is 32 iterations of integer math. The output never stops or glitches.
+* Overwriting the buffer while DMA reads it is safe. With ARR preload on, every period the timer emits is complete and valid.
+* For one pass through the buffer (~1 ms at 30 kHz), periods are a mix of old and new values, so the frequency settles within that time.
+* If the switch must be exact, enable the DMA half-transfer and transfer-complete interrupts and rewrite only the half not being read.
+* Retuning faster than about a thousand times per second gains nothing, because 1 Hz accuracy only holds averaged over one buffer pass.
+Limitations and caveats
+* Period jitter: individual periods differ by one tick (~6 ns at 168 MHz). Fine for transducers and resonant loads; not suitable if every period must be identical. Use an external DDS chip such as the AD9833 for that.
+* Accuracy vs. resolution: the HSE crystal sets absolute accuracy. ±20 ppm is ±0.8 Hz at 40 kHz, so calibrate or use a TCXO if absolute frequency matters.
+* DMA stream conflicts: DMA2 Stream 5 Channel 6 is hard-wired to TIM1_UP. Check nothing else in the project needs that stream.
+* Frequency range: TIM1 is 16-bit, so the lowest frequency at PSC = 0 is 168 MHz / 65536 ≈ 2.6 kHz. 30–40 kHz is well inside the range.
+* Use PWM mode, not toggle mode: toggle mode needs two timer periods per output cycle, which doubles the step size.

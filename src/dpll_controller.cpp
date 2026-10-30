@@ -9,12 +9,13 @@
 #include "dpll_controller.h"
 #include "dac_output.h"
 #include "dds_ad9833.h"
+#include "dma_dithering_sqw.h"
 
 namespace dpll {
 
 namespace {
 
-GeneratorSource s_generatorSource = GENERATOR_SOURCE_DAC;
+GeneratorSource s_generatorSource = GENERATOR_SOURCE_PWM_DITHER;
 TrackingDirection s_trackingDirection = TRACKING_DIR_NORMAL;
 
 // DAC mode PID gains (V/ns, V/ns/s)
@@ -69,10 +70,15 @@ bool     s_signalWasAbsent     = false;
 
 } // namespace
 
+bool isFrequencyGenerator()
+{
+  return (s_generatorSource == GENERATOR_SOURCE_DDS || s_generatorSource == GENERATOR_SOURCE_PWM_DITHER);
+}
+
 void begin(float centerVoltage, float kp, float ki, float kd)
 {
   s_centerVoltage = centerVoltage;
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (isFrequencyGenerator()) {
     s_ddsKp = kp;
     s_ddsKi = ki;
     s_ddsKd = kd;
@@ -87,7 +93,11 @@ void begin(float centerVoltage, float kp, float ki, float kd)
   s_haveLastError = false;
   s_enabled = true;
 
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dac::setVoltage(1.65f); // park DAC
+    dma_sqw::begin(s_outputFreq);
+    dma_sqw::enableOutput(true);
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dac::setVoltage(1.65f); // park DAC
     dds::setFrequency((double)s_outputFreq);
     dds::enableOutput(true);
@@ -110,17 +120,27 @@ void setGeneratorSource(GeneratorSource src)
     return;
   }
 
+  // Stop previous generator if needed
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dma_sqw::stop();
+  }
+
   s_generatorSource = src;
   s_integral = 0.0f;
   s_haveLastError = false;
 
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
-    // Park DAC safely at neutral 1.65 V
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
     dac::setVoltage(1.65f);
-    // Initialize DDS to center frequency and enable output
+    dds::enableOutput(false); // Mute DDS
+    s_outputFreq = s_ddsCenterFreq;
+    dma_sqw::begin(s_outputFreq);
+    dma_sqw::enableOutput(s_enabled);
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+    dac::setVoltage(1.65f);
+    dds::setMcoClock(dds::getMcoClock()); // Reconfigure PA8 back to MCO1
     s_outputFreq = s_ddsCenterFreq;
     dds::setFrequency((double)s_outputFreq);
-    dds::enableOutput(true);
+    dds::enableOutput(s_enabled);
   } else {
     // Restore DAC to center voltage
     s_outputVoltage = s_centerVoltage;
@@ -151,7 +171,11 @@ void setDdsCenterFreq(float freqHz)
   if (freqHz >= 1000.0f && freqHz <= 500000.0f) {
     s_ddsCenterFreq = freqHz;
     s_outputFreq = s_ddsCenterFreq;
-    dds::setFrequency((double)s_outputFreq);
+    if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+      dma_sqw::setFrequency(s_outputFreq);
+    } else {
+      dds::setFrequency((double)s_outputFreq);
+    }
   }
 }
 
@@ -187,6 +211,11 @@ void setDdsMaxSlew(float hzPerSecond)
 
 float lastFrequency()
 {
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    return dma_sqw::getFrequency();
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+    return static_cast<float>(dds::getFrequency());
+  }
   return s_outputFreq;
 }
 
@@ -197,7 +226,7 @@ void setTargetPhase(float targetNs)
 
 void setGains(float kp, float ki)
 {
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (isFrequencyGenerator()) {
     s_ddsKp = kp;
     s_ddsKi = ki;
   } else {
@@ -208,7 +237,7 @@ void setGains(float kp, float ki)
 
 void setKd(float kd)
 {
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (isFrequencyGenerator()) {
     s_ddsKd = kd;
   } else {
     s_dacKd = kd;
@@ -224,9 +253,9 @@ void setOutputLimits(float minV, float maxV)
 void setMaxSlew(float ratePerSecond)
 {
   if (ratePerSecond <= 0.0f) {
-    ratePerSecond = (s_generatorSource == GENERATOR_SOURCE_DDS) ? 20000.0f : 30.0f;
+    ratePerSecond = isFrequencyGenerator() ? 20000.0f : 30.0f;
   }
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (isFrequencyGenerator()) {
     s_ddsMaxSlew = ratePerSecond;
   } else {
     s_maxSlew = ratePerSecond;
@@ -236,9 +265,13 @@ void setMaxSlew(float ratePerSecond)
 void enable(bool on)
 {
   if (on && !s_enabled) {
-    if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+    if (isFrequencyGenerator()) {
       s_integral = s_outputFreq - s_ddsCenterFreq;
-      dds::enableOutput(true);
+      if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+        dma_sqw::enableOutput(true);
+      } else {
+        dds::enableOutput(true);
+      }
     } else {
       s_integral = s_outputVoltage - s_centerVoltage;
     }
@@ -262,7 +295,9 @@ void reset()
   s_outputFreq = s_ddsCenterFreq;
   s_haveLastError = false;
 
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dma_sqw::setFrequency(s_outputFreq);
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dds::setFrequency((double)s_outputFreq);
   } else {
     dac::setVoltage(s_outputVoltage);
@@ -290,7 +325,10 @@ void restartAtFrequency(float startingFreq)
   s_outputFreq = startingFreq;
   s_haveLastError = false;
   s_enabled = true;
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dma_sqw::enableOutput(true);
+    dma_sqw::setFrequency(s_outputFreq);
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dds::enableOutput(true);
     dds::setFrequency((double)s_outputFreq);
   }
@@ -299,7 +337,7 @@ void restartAtFrequency(float startingFreq)
 float update(float phaseErrorNs, float dtSeconds)
 {
   if (!s_enabled) {
-    return (s_generatorSource == GENERATOR_SOURCE_DDS) ? s_outputFreq : s_outputVoltage;
+    return isFrequencyGenerator() ? s_outputFreq : s_outputVoltage;
   }
 
   // Sanitize dt (avoid huge steps on first call / overflow)
@@ -324,9 +362,9 @@ float update(float phaseErrorNs, float dtSeconds)
     intError = 0.0f;
   }
 
-  if (s_generatorSource == GENERATOR_SOURCE_DDS)
+  if (isFrequencyGenerator())
   {
-    // --- Direct DDS Frequency Tracking (Continuous Incremental Form: f_new = f_curr ± Δf) ---
+    // --- Direct Frequency Tracking (Continuous Incremental Form: f_new = f_curr ± Δf) ---
     float deltaProp = s_ddsKp * error;
     float deltaInt  = s_ddsKi * intError * dtSeconds;
 
@@ -341,7 +379,7 @@ float update(float phaseErrorNs, float dtSeconds)
     s_outputFreq += deltaInt;
     float targetFreq = s_outputFreq + deltaProp + derivative;
 
-    // Anti-stall guard (DDS mode):
+    // Anti-stall guard (Frequency mode):
     // If operating below resonance frequency and measured phase is in capacitive dead zone,
     // prevent downward positive feedback runaway by steering frequency back toward center.
     if ((phaseErrorNs > (s_targetPhaseNs + 800.0f)) &&
@@ -366,7 +404,9 @@ float update(float phaseErrorNs, float dtSeconds)
 
     // Frequency slew-rate limiting (Hz/s)
     float maxStep = s_ddsMaxSlew * dtSeconds;
-    float lastF = static_cast<float>(dds::getFrequency());
+    float lastF = (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER)
+                    ? dma_sqw::getFrequency()
+                    : static_cast<float>(dds::getFrequency());
     if (lastF <= 0.0f) lastF = s_outputFreq;
     if (targetFreq - lastF > maxStep) {
       targetFreq = lastF + maxStep;
@@ -374,7 +414,11 @@ float update(float phaseErrorNs, float dtSeconds)
       targetFreq = lastF - maxStep;
     }
 
-    dds::setFrequency((double)targetFreq);
+    if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+      dma_sqw::setFrequency(targetFreq);
+    } else {
+      dds::setFrequency((double)targetFreq);
+    }
     return targetFreq;
   }
   else
@@ -442,7 +486,9 @@ void shutdown()
 {
   s_enabled = false;
   s_integral = 0.0f;
-  if (s_generatorSource == GENERATOR_SOURCE_DDS) {
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dma_sqw::enableOutput(false);
+  } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dds::enableOutput(false);
   } else {
     s_outputVoltage = s_minVoltage;
@@ -467,21 +513,28 @@ void manualSetFreq(float freqHz)
   s_manualMode = true;
   s_enabled = false;
   s_integral = 0.0f;
-  s_generatorSource = GENERATOR_SOURCE_DDS;
+  if (!isFrequencyGenerator()) {
+    s_generatorSource = GENERATOR_SOURCE_PWM_DITHER;
+  }
   if (freqHz < s_ddsMinFreq) freqHz = s_ddsMinFreq;
   if (freqHz > s_ddsMaxFreq) freqHz = s_ddsMaxFreq;
   s_outputFreq = freqHz;
   dac::setVoltage(1.65f); // Park DAC safely at 1.65 V neutral
-  dds::enableOutput(true);
-  dds::setFrequency((double)s_outputFreq);
+  if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+    dma_sqw::setFrequency(s_outputFreq);
+    dma_sqw::enableOutput(true);
+  } else {
+    dds::enableOutput(true);
+    dds::setFrequency((double)s_outputFreq);
+  }
 }
 
-float getKp()            { return (s_generatorSource == GENERATOR_SOURCE_DDS) ? s_ddsKp : s_dacKp; }
-float getKi()            { return (s_generatorSource == GENERATOR_SOURCE_DDS) ? s_ddsKi : s_dacKi; }
-float getKd()            { return (s_generatorSource == GENERATOR_SOURCE_DDS) ? s_ddsKd : s_dacKd; }
+float getKp()            { return isFrequencyGenerator() ? s_ddsKp : s_dacKp; }
+float getKi()            { return isFrequencyGenerator() ? s_ddsKi : s_dacKi; }
+float getKd()            { return isFrequencyGenerator() ? s_ddsKd : s_dacKd; }
 float getCenterVoltage() { return s_centerVoltage; }
 float getTargetPhase()   { return s_targetPhaseNs; }
-float getMaxSlew()       { return (s_generatorSource == GENERATOR_SOURCE_DDS) ? s_ddsMaxSlew : s_maxSlew; }
+float getMaxSlew()       { return isFrequencyGenerator() ? s_ddsMaxSlew : s_maxSlew; }
 
 // --- Loop / acquisition config ---
 uint32_t getLoopPeriodMs()          { return s_loopPeriodMs; }

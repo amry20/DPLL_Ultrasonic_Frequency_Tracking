@@ -6,6 +6,7 @@
 #include "eeprom_24lc16b.h"
 #include "eeprom_config.h"
 #include "dds_ad9833.h"
+#include "dma_dithering_sqw.h"
 #include <HardwareSerial.h>
 extern "C" void SystemClock_Config(void)
 {
@@ -92,21 +93,22 @@ void setup()
   }
   else
   {
-    // Apply baseline default DPLL & DDS parameters
+    // Apply baseline default DPLL & Frequency parameters (PWM Dither default)
+    dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
     dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
     dpll::setTargetPhase(600.0f);
     dpll::setOutputLimits(0.0f, 3.3f);
-    dpll::setMaxSlew(30.0f);
+    dpll::setMaxSlew(20000.0f);
     dpll::setDdsCenterFreq(28000.0f);
-    dds::setMcoClock(dds::MCO_CLOCK_HSE_8MHZ);
-    DebugPort.println(F("EEPROM: Using default DPLL configuration."));
+    dpll::setDdsFreqLimits(20000.0f, 40000.0f);
+    DebugPort.println(F("EEPROM: Using default DPLL configuration (PWM Dither)."));
   }
 
   // 3. Initialize hardware peripherals according to the active configuration:
 
-  // DAC control output: PA4, configured with active center voltage (or 1.65 V neutral in DDS mode)
+  // DAC control output: PA4, configured with active center voltage (or 1.65 V neutral in frequency mode)
   dac::begin();
-  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+  if (dpll::isFrequencyGenerator())
   {
     dac::setVoltage(1.65f); // park DAC at neutral mid-scale
   }
@@ -115,12 +117,22 @@ void setup()
     dac::setVoltage(dpll::getCenterVoltage());
   }
 
-  // Initialize AD9833 DDS Generator:
-  // Starts directly with configured MCO clock preset and active center frequency (no intermediate jumping)
-  // PA8 = MCLK (MCO1 hardware clock), PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
-  dds::begin((double)dpll::getDdsCenterFreq(), SQUARE_WAVE, dds::getMcoClock());
-  DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %s, %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
-                   dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution(), dds::getFrequency());
+  // Initialize frequency generator:
+  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_PWM_DITHER)
+  {
+    dma_sqw::begin(dpll::getDdsCenterFreq());
+    DebugPort.printf("PWM Dither Generator: Initialized on PA8 (TIM1_CH1, Res: %.4f Hz, Freq: %.2f Hz)\n",
+                     dma_sqw::getResolution(dpll::getDdsCenterFreq()), dma_sqw::getFrequency());
+  }
+  else
+  {
+    // Initialize AD9833 DDS Generator:
+    // Starts directly with configured MCO clock preset and active center frequency (no intermediate jumping)
+    // PA8 = MCLK (MCO1 hardware clock), PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
+    dds::begin((double)dpll::getDdsCenterFreq(), SQUARE_WAVE, dds::getMcoClock());
+    DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %s, %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
+                     dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution(), dds::getFrequency());
+  }
 
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising/Falling/Both edge trigger from configuration)
@@ -410,10 +422,13 @@ void commandProccessor()
         if (plen >= 1)
         {
           uint8_t src = pl[0];
-          if (src <= 1)
+          if (src <= 2)
           {
             dpll::setGeneratorSource((dpll::GeneratorSource)src);
-            DebugPort.printf("[DPLL] Generator source set to: %s\n", src == 1 ? "DDS (AD9833)" : "DAC (CD4046)");
+            const char* srcName = "DAC (CD4046)";
+            if (src == 1) srcName = "DDS (AD9833)";
+            else if (src == 2) srcName = "PWM Dither (TIM1 PA8)";
+            DebugPort.printf("[DPLL] Generator source set to: %s\n", srcName);
           }
         }
         break;
@@ -747,12 +762,12 @@ void processDPLL()
       candidate = dpll::getLockedCenterV();
     } else {
       s_haveParkV = false;
-      candidate = (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+      candidate = dpll::isFrequencyGenerator()
                 ? dpll::getDdsCenterFreq()
                 : dpll::getCenterVoltage();
     }
 
-    if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+    if (dpll::isFrequencyGenerator()) {
       const float centerF = dpll::getDdsCenterFreq();
       if (candidate <= 0.0f || fabsf(candidate - centerF) > 1500.0f) {
         return centerF;
@@ -810,7 +825,7 @@ void processDPLL()
         s_lastGoodPhase = cleanPhase;
 
         bool isSane = false;
-        if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+        if (dpll::isFrequencyGenerator()) {
           isSane = (cleanV >= dpll::getDdsMinFreq() && cleanV <= dpll::getDdsMaxFreq());
         } else {
           isSane = (cleanV >= 0.20f && cleanV <= 3.10f && fabsf(cleanV - dpll::getCenterVoltage()) <= 0.80f);
@@ -870,7 +885,7 @@ void processDPLL()
         if (dpll::haveLockedCenter() && s_haveParkV) {
           // Park at the confirmed operating point near resonance while lock memory is valid.
           const float parkV = restartValue(dpll::getCenterVoltage());
-          if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+          if (dpll::isFrequencyGenerator()) {
             dpll::restartAtFrequency(parkV);
           } else {
             dpll::restartAtVoltage(parkV);
@@ -898,7 +913,7 @@ void processDPLL()
       DebugPort.printf("[DPLL] Re-acquire: reset to center\n");
     } else {
       // FREEZE / Resume: start exactly from the locked center point
-      if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+      if (dpll::isFrequencyGenerator()) {
         float resumeF = restartValue(dpll::getDdsCenterFreq());
         dpll::restartAtFrequency(resumeF);
         DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", resumeF);
@@ -1031,9 +1046,9 @@ void processDPLL()
 
   // Check if controller is pinned to rails:
   // In DAC mode: check 0.05 V - 3.25 V
-  // In DDS mode: check within 5 Hz of [minFreq, maxFreq]
+  // In Frequency mode: check within 5 Hz of [minFreq, maxFreq]
   bool isRailed = false;
-  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+  if (dpll::isFrequencyGenerator()) {
     float currF = controlOutput;
     float minF  = dpll::getDdsMinFreq();
     float maxF  = dpll::getDdsMaxFreq();
@@ -1060,7 +1075,7 @@ void processDPLL()
     if (nowMs - lastRailWarnMs >= 1000U) {
       lastRailWarnMs = nowMs;
       DebugPort.printf("[DPLL RAIL] Pinned to %s rail limit!\n",
-                       dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS ? "DDS Frequency" : "DAC Voltage");
+                       dpll::isFrequencyGenerator() ? "Frequency" : "DAC Voltage");
     }
   }
 
@@ -1098,7 +1113,7 @@ void processDPLL()
       if (lockHoldCount >= holdNeed) {
         s_dpllState = STATE_LOCKED;
         s_lockedThisPulse = true;
-        if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) {
+        if (dpll::isFrequencyGenerator()) {
           DebugPort.printf("[DPLL LOCKED] Freq = %.1f Hz | Phase = %.1f ns\n",
                            controlOutput, filteredPhaseNs);
         } else {
@@ -1699,8 +1714,15 @@ void handleDebugCommand(const String &cmd)
   {
     if (arg.length() == 0)
     {
-      DebugPort.printf("Generator Source: %s\n",
-                       dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS ? "DDS (AD9833)" : "DAC (CD4046 VCO)");
+      const char* srcName = "DAC (CD4046 VCO)";
+      if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS) srcName = "DDS (AD9833)";
+      else if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_PWM_DITHER) srcName = "PWM Dither (TIM1 PA8)";
+      DebugPort.printf("Generator Source: %s\n", srcName);
+    }
+    else if (arg == "pwm" || arg == "dither" || arg == "sqw" || arg == "2")
+    {
+      dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
+      DebugPort.println(F("Generator Source set to PWM Dither (TIM1 PA8). Jumper PA8->Driver & PA8->PA0 (REF)!"));
     }
     else if (arg == "dds" || arg == "1")
     {
@@ -1714,7 +1736,58 @@ void handleDebugCommand(const String &cmd)
     }
     else
     {
-      DebugPort.println(F("ERR: Invalid source. Use 'dac' or 'dds'."));
+      DebugPort.println(F("ERR: Invalid source. Use 'dac', 'dds', or 'pwm'."));
+    }
+  }
+  else if (name == "sqw" || name == "pwmdither")
+  {
+    String subCmd = arg;
+    String subArg = "";
+    int spaceIdx = arg.indexOf(' ');
+    if (spaceIdx > 0)
+    {
+      subCmd = arg.substring(0, spaceIdx);
+      subArg = arg.substring(spaceIdx + 1);
+    }
+    subCmd.toLowerCase();
+    subArg.trim();
+
+    if (subCmd == "status" || subCmd == "")
+    {
+      DebugPort.println(F("--- STM32 TIM1 PWM DMA Dithering Status ---"));
+      DebugPort.printf("Hardware  : TIM1_CH1 on PA8, DMA2 Stream 5 Channel 6\n");
+      DebugPort.printf("Output    : %s\n", dma_sqw::isOutputEnabled() ? "ENABLED (ACTIVE)" : "DISABLED (MUTED)");
+      DebugPort.printf("Active Src: %s\n", (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_PWM_DITHER) ? "YES (ACTIVE TRACKER)" : "NO");
+      DebugPort.printf("Frequency : %.2f Hz\n", dma_sqw::getFrequency());
+      DebugPort.printf("Resolution: %.4f Hz (at %.0f Hz)\n", dma_sqw::getResolution(dma_sqw::getFrequency()), dma_sqw::getFrequency());
+      DebugPort.printf("Dither Buf: %u entries (168 MHz APB2 timer clock, PSC=0)\n", dma_sqw::N_BUF);
+    }
+    else if (subCmd == "freq")
+    {
+      float f = subArg.toFloat();
+      if (f >= 1000.0f && f <= 100000.0f)
+      {
+        dpll::manualSetFreq(f);
+        DebugPort.printf("PWM Dither Frequency manually set to: %.2f Hz (Loop paused)\n", f);
+      }
+      else
+      {
+        DebugPort.println(F("ERR: Frequency must be between 1000 and 100000 Hz."));
+      }
+    }
+    else if (subCmd == "on")
+    {
+      dma_sqw::enableOutput(true);
+      DebugPort.println(F("PWM Dither output ENABLED"));
+    }
+    else if (subCmd == "off")
+    {
+      dma_sqw::enableOutput(false);
+      DebugPort.println(F("PWM Dither output DISABLED (MUTED)"));
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Unknown sqw subcommand. Use: status, freq <Hz>, on, off"));
     }
   }
   else if (name == "ddsfreq")

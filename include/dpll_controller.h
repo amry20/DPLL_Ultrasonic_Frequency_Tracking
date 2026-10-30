@@ -31,8 +31,9 @@ namespace dpll
 {
     // Output generator mode
     enum GeneratorSource : uint8_t {
-        GENERATOR_SOURCE_DAC = 0, // External VCO (CD4046) driven by DAC1 (PA4)
-        GENERATOR_SOURCE_DDS = 1  // Direct DDS (AD9833) frequency modulation via SPI1
+        GENERATOR_SOURCE_DAC        = 0, // External VCO (CD4046) driven by DAC1 (PA4)
+        GENERATOR_SOURCE_DDS        = 1, // Direct DDS (AD9833) frequency modulation via SPI1
+        GENERATOR_SOURCE_PWM_DITHER = 2  // Direct STM32 TIM1 PWM DMA Dithering on PA8
     };
 
     // Tracking loop direction (feedback sign)
@@ -43,14 +44,15 @@ namespace dpll
 
     // Initialize the controller.
     // centerVoltage : VCO voltage that produces the nominal/center frequency.
-    // kp            : proportional gain (V per nanosecond of phase error for DAC, Hz/ns for DDS).
-    // ki            : integral gain (V per nanosecond per second for DAC, Hz/ns/s for DDS).
+    // kp            : proportional gain (V per nanosecond of phase error for DAC, Hz/ns for DDS/PWM).
+    // ki            : integral gain (V per nanosecond per second for DAC, Hz/ns/s for DDS/PWM).
     // kd            : derivative gain.
     void begin(float centerVoltage, float kp, float ki, float kd = 0.0f);
 
-    // Generator Source (DAC vs DDS)
+    // Generator Source (DAC vs DDS vs PWM Dither)
     GeneratorSource getGeneratorSource();
     void            setGeneratorSource(GeneratorSource src);
+    bool            isFrequencyGenerator();
 
     // Tracking loop direction (Normal vs Inverted)
     TrackingDirection getTrackingDirection();

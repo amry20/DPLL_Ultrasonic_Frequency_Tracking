@@ -32,7 +32,7 @@ namespace eeprom_config
         uint32_t lockMemoryTimeoutMs;
         uint32_t streamPeriodMs;
         uint8_t  signalLossBehavior;
-        uint8_t  generatorSource;       // 0=DAC, 1=DDS
+        uint8_t  generatorSource;       // 0=DAC, 1=DDS, 2=PWM_DITHER
         uint8_t  ddsMcoClock;           // McoClockSelection (0=8MHz HSE, 1=4MHz HSE, etc.)
         uint8_t  captureRefEdge;        // 0=Rising, 1=Falling, 2=Both
         uint8_t  captureZcdEdge;        // 0=Rising, 1=Falling, 2=Both
