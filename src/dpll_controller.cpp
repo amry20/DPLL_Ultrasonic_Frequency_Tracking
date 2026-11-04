@@ -10,10 +10,19 @@
 #include "dac_output.h"
 #include "dds_ad9833.h"
 #include "dma_dithering_sqw.h"
+#include "phase_capture.h"
 
 namespace dpll {
 
 namespace {
+
+// Every generator frequency write goes through here so the capture layer can tell a commanded
+// frequency step apart from a real pulse-end jump.
+inline void setPwmFreq(float f)
+{
+  dma_sqw::setFrequency(f);
+  phase_capture::notifyFrequencyCommand();
+}
 
 GeneratorSource s_generatorSource = GENERATOR_SOURCE_PWM_DITHER;
 TrackingDirection s_trackingDirection = TRACKING_DIR_NORMAL;
@@ -67,6 +76,7 @@ SignalLossBehavior s_signalLossBehavior = SIGNAL_LOSS_FREEZE;
 uint32_t s_lockMemoryTimeoutMs = 5000; // 0 = never expire
 uint32_t s_signalAbsentSince   = 0;    // millis() when signal first went absent
 bool     s_signalWasAbsent     = false;
+bool     s_freezeTimedOut      = false;
 
 } // namespace
 
@@ -116,6 +126,11 @@ GeneratorSource getGeneratorSource()
 
 void setGeneratorSource(GeneratorSource src)
 {
+  // Fallback AD9833 DDS to PWM Dithering (PA5 is repurposed for Sonication Gate)
+  if (src == GENERATOR_SOURCE_DDS) {
+    src = GENERATOR_SOURCE_PWM_DITHER;
+  }
+
   if (src == s_generatorSource) {
     return;
   }
@@ -171,8 +186,10 @@ void setDdsCenterFreq(float freqHz)
   if (freqHz >= 1000.0f && freqHz <= 500000.0f) {
     s_ddsCenterFreq = freqHz;
     s_outputFreq = s_ddsCenterFreq;
+    s_haveLockedCenter = false;
+    s_haveLastError = false;
     if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
-      dma_sqw::setFrequency(s_outputFreq);
+      setPwmFreq(s_outputFreq);
     } else {
       dds::setFrequency((double)s_outputFreq);
     }
@@ -194,6 +211,14 @@ void setDdsFreqLimits(float minHz, float maxHz)
   if (minHz >= 1000.0f && maxHz > minHz && maxHz <= 500000.0f) {
     s_ddsMinFreq = minHz;
     s_ddsMaxFreq = maxHz;
+    if (s_outputFreq < s_ddsMinFreq) s_outputFreq = s_ddsMinFreq;
+    if (s_outputFreq > s_ddsMaxFreq) s_outputFreq = s_ddsMaxFreq;
+    if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
+      float currF = dma_sqw::getFrequency();
+      if (currF > 0.0f && (currF < s_ddsMinFreq || currF > s_ddsMaxFreq)) {
+        setPwmFreq(s_outputFreq);
+      }
+    }
   }
 }
 
@@ -222,6 +247,18 @@ float lastFrequency()
 void setTargetPhase(float targetNs)
 {
   s_targetPhaseNs = targetNs;
+}
+
+void setCenterVoltage(float centerV)
+{
+  if (centerV >= 0.0f && centerV <= 3.3f) {
+    s_centerVoltage = centerV;
+    if (!isFrequencyGenerator()) {
+      s_outputVoltage = centerV;
+      s_haveLastError = false;
+      dac::setVoltage(s_outputVoltage);
+    }
+  }
 }
 
 void setGains(float kp, float ki)
@@ -296,7 +333,7 @@ void reset()
   s_haveLastError = false;
 
   if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
-    dma_sqw::setFrequency(s_outputFreq);
+    setPwmFreq(s_outputFreq);
   } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dds::setFrequency((double)s_outputFreq);
   } else {
@@ -327,7 +364,7 @@ void restartAtFrequency(float startingFreq)
   s_enabled = true;
   if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
     dma_sqw::enableOutput(true);
-    dma_sqw::setFrequency(s_outputFreq);
+    setPwmFreq(s_outputFreq);
   } else if (s_generatorSource == GENERATOR_SOURCE_DDS) {
     dds::enableOutput(true);
     dds::setFrequency((double)s_outputFreq);
@@ -364,7 +401,7 @@ float update(float phaseErrorNs, float dtSeconds)
 
   if (isFrequencyGenerator())
   {
-    // --- Direct Frequency Tracking (Continuous Incremental Form: f_new = f_curr ± Δf) ---
+    // --- Direct Frequency Tracking (PID with Slew & Bounds Anti-Windup) ---
     float deltaProp = s_ddsKp * error;
     float deltaInt  = s_ddsKi * intError * dtSeconds;
 
@@ -375,47 +412,52 @@ float update(float phaseErrorNs, float dtSeconds)
     s_lastError = error;
     s_haveLastError = true;
 
-    // Accumulate integral smoothly from current operating point
-    s_outputFreq += deltaInt;
-    float targetFreq = s_outputFreq + deltaProp + derivative;
-
-    // Anti-stall guard (Frequency mode):
-    // If operating below resonance frequency and measured phase is in capacitive dead zone,
-    // prevent downward positive feedback runaway by steering frequency back toward center.
-    if ((phaseErrorNs > (s_targetPhaseNs + 800.0f)) &&
-        (s_outputFreq < (s_ddsCenterFreq - 300.0f))) {
-      const float recoveryStep = s_ddsMaxSlew * 0.5f * dtSeconds;
-      s_outputFreq += recoveryStep;
-      if (s_outputFreq > s_ddsCenterFreq) {
-        s_outputFreq = s_ddsCenterFreq;
-      }
-      targetFreq = s_outputFreq;
-      s_haveLastError = false;
-    }
-
-    // Clamp output within frequency bounds [min, max] with anti-windup
-    if (targetFreq > s_ddsMaxFreq) {
-      targetFreq = s_ddsMaxFreq;
-      s_outputFreq = s_ddsMaxFreq - deltaProp;
-    } else if (targetFreq < s_ddsMinFreq) {
-      targetFreq = s_ddsMinFreq;
-      s_outputFreq = s_ddsMinFreq - deltaProp;
-    }
-
-    // Frequency slew-rate limiting (Hz/s)
-    float maxStep = s_ddsMaxSlew * dtSeconds;
     float lastF = (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER)
                     ? dma_sqw::getFrequency()
                     : static_cast<float>(dds::getFrequency());
     if (lastF <= 0.0f) lastF = s_outputFreq;
-    if (targetFreq - lastF > maxStep) {
-      targetFreq = lastF + maxStep;
-    } else if (lastF - targetFreq > maxStep) {
-      targetFreq = lastF - maxStep;
+
+    // Effective output bounds for this step combine [minFreq, maxFreq] and max slew rate
+    float maxStep = s_ddsMaxSlew * dtSeconds;
+    float stepMaxFreq = s_ddsMaxFreq;
+    float stepMinFreq = s_ddsMinFreq;
+    if (lastF + maxStep < stepMaxFreq) stepMaxFreq = lastF + maxStep;
+    if (lastF - maxStep > stepMinFreq) stepMinFreq = lastF - maxStep;
+    if (stepMaxFreq < s_ddsMinFreq) stepMaxFreq = s_ddsMinFreq;
+    if (stepMinFreq > s_ddsMaxFreq) stepMinFreq = s_ddsMaxFreq;
+
+    // Candidate integral update bounded within [minFreq, maxFreq]
+    float nextIntegralFreq = s_outputFreq + deltaInt;
+    if (nextIntegralFreq > s_ddsMaxFreq) nextIntegralFreq = s_ddsMaxFreq;
+    if (nextIntegralFreq < s_ddsMinFreq) nextIntegralFreq = s_ddsMinFreq;
+
+    float pdTerm = deltaProp + derivative;
+    float targetFreq = nextIntegralFreq + pdTerm;
+
+    // Clamp output to effective step bounds with directional anti-windup
+    // (never push s_outputFreq backwards when deltaProp is large, and never wind up past slew limit)
+    if (targetFreq > stepMaxFreq) {
+      targetFreq = stepMaxFreq;
+      if (deltaInt > 0.0f) {
+        float maxAllowedInt = stepMaxFreq - pdTerm;
+        if (maxAllowedInt < s_outputFreq) maxAllowedInt = s_outputFreq;
+        if (nextIntegralFreq > maxAllowedInt) nextIntegralFreq = maxAllowedInt;
+      }
+    } else if (targetFreq < stepMinFreq) {
+      targetFreq = stepMinFreq;
+      if (deltaInt < 0.0f) {
+        float minAllowedInt = stepMinFreq - pdTerm;
+        if (minAllowedInt > s_outputFreq) minAllowedInt = s_outputFreq;
+        if (nextIntegralFreq < minAllowedInt) nextIntegralFreq = minAllowedInt;
+      }
     }
 
+    if (nextIntegralFreq > s_ddsMaxFreq) nextIntegralFreq = s_ddsMaxFreq;
+    if (nextIntegralFreq < s_ddsMinFreq) nextIntegralFreq = s_ddsMinFreq;
+    s_outputFreq = nextIntegralFreq;
+
     if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
-      dma_sqw::setFrequency(targetFreq);
+      setPwmFreq(targetFreq);
     } else {
       dds::setFrequency((double)targetFreq);
     }
@@ -521,7 +563,7 @@ void manualSetFreq(float freqHz)
   s_outputFreq = freqHz;
   dac::setVoltage(1.65f); // Park DAC safely at 1.65 V neutral
   if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
-    dma_sqw::setFrequency(s_outputFreq);
+    setPwmFreq(s_outputFreq);
     dma_sqw::enableOutput(true);
   } else {
     dds::enableOutput(true);
@@ -552,6 +594,7 @@ void     setLockedCenter(float v)   {
   s_lockedCenterV    = v;
   s_haveLockedCenter = true;
   s_signalWasAbsent  = false;
+  s_freezeTimedOut   = false;
 }
 void     clearLockedCenter()        { s_haveLockedCenter = false; s_lockedCenterV = s_centerVoltage; }
 
@@ -567,18 +610,23 @@ void               setSignalLossBehavior(SignalLossBehavior b) { s_signalLossBeh
 uint32_t getLockMemoryTimeoutMs()          { return s_lockMemoryTimeoutMs; }
 void     setLockMemoryTimeoutMs(uint32_t ms) { s_lockMemoryTimeoutMs = ms; }
 
+bool     isFreezeTimedOut()                { return s_freezeTimedOut; }
+
 void tickSignalAbsent(uint32_t nowMs)
 {
   if (nowMs == 0) {
     s_signalWasAbsent = false;
+    s_freezeTimedOut  = false;
     return;
   }
   if (!s_signalWasAbsent) {
     s_signalAbsentSince = nowMs;
     s_signalWasAbsent   = true;
+    s_freezeTimedOut    = false;
   }
-  if (s_lockMemoryTimeoutMs > 0) {
+  if (s_lockMemoryTimeoutMs > 0 && !s_freezeTimedOut) {
     if ((nowMs - s_signalAbsentSince) >= s_lockMemoryTimeoutMs) {
+      s_freezeTimedOut   = true;
       s_haveLockedCenter = false;
       s_lockedCenterV    = s_centerVoltage;
       if (s_signalLossBehavior == SIGNAL_LOSS_FREEZE) {
@@ -593,7 +641,7 @@ void tickSignalAbsent(uint32_t nowMs)
   } else if (s_signalLossBehavior == SIGNAL_LOSS_ZERO) {
     shutdown();
   }
-  // SIGNAL_LOSS_FREEZE holds last output
+  // SIGNAL_LOSS_FREEZE holds last output until s_lockMemoryTimeoutMs expires
 }
 
 } // namespace dpll

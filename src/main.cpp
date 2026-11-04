@@ -7,6 +7,7 @@
 #include "eeprom_config.h"
 #include "dds_ad9833.h"
 #include "dma_dithering_sqw.h"
+#include "sonication_controller.h"
 #include <HardwareSerial.h>
 extern "C" void SystemClock_Config(void)
 {
@@ -49,6 +50,8 @@ extern "C" void SystemClock_Config(void)
 }
 
 #define HEARTBEAT_LED      PC13
+#define HEARTBEAT_LED_PN      PC_13 // PinName form for digitalWriteFast()
+#define LOCK_INDICATOR_LED_PN PC_10 // PinName form for digitalWriteFast()
 #define LOCK_INDICATOR_LED PC10 // active high. Lock indicator when state changes to Locked.
 void heartbeat();
 void processSerialDebugCommand();
@@ -65,14 +68,14 @@ void setup()
   setupSerialDebug();
   com::begin();
   pinMode(HEARTBEAT_LED, OUTPUT);
-  digitalWrite(HEARTBEAT_LED, HIGH);
+  digitalWriteFast(HEARTBEAT_LED_PN, HIGH);
   pinMode(LOCK_INDICATOR_LED, OUTPUT);
-  digitalWrite(LOCK_INDICATOR_LED, LOW);
+  digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
   // Startup self-test: blink lock indicator LED 3 times (active HIGH)
   for (int i = 0; i < 3; i++) {
-    digitalWrite(LOCK_INDICATOR_LED, HIGH);
+    digitalWriteFast(LOCK_INDICATOR_LED_PN, HIGH);
     delay(80);
-    digitalWrite(LOCK_INDICATOR_LED, LOW);
+    digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
     delay(80);
   }
 
@@ -95,7 +98,7 @@ void setup()
   {
     // Apply baseline default DPLL & Frequency parameters (PWM Dither default)
     dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
-    dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
+    dpll::begin(1.65f, 0.01f, 0.1f, 0.0f);
     dpll::setTargetPhase(600.0f);
     dpll::setOutputLimits(0.0f, 3.3f);
     dpll::setMaxSlew(20000.0f);
@@ -118,21 +121,23 @@ void setup()
   }
 
   // Initialize frequency generator:
+  // AD9833 DDS is retired and PA5 is reassigned to Sonication Pulse Controller.
+  // Fallback any DDS selection directly to STM32 TIM1 PWM Dithering (PA8).
+  if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_DDS)
+  {
+    dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
+  }
+
   if (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_PWM_DITHER)
   {
     dma_sqw::begin(dpll::getDdsCenterFreq());
     DebugPort.printf("PWM Dither Generator: Initialized on PA8 (TIM1_CH1, Res: %.4f Hz, Freq: %.2f Hz)\n",
                      dma_sqw::getResolution(dpll::getDdsCenterFreq()), dma_sqw::getFrequency());
   }
-  else
-  {
-    // Initialize AD9833 DDS Generator:
-    // Starts directly with configured MCO clock preset and active center frequency (no intermediate jumping)
-    // PA8 = MCLK (MCO1 hardware clock), PC4 = FSYNC / SS, PA5 = SCK, PA7 = MOSI
-    dds::begin((double)dpll::getDdsCenterFreq(), SQUARE_WAVE, dds::getMcoClock());
-    DebugPort.printf("AD9833 DDS: Initialized Square Wave (MCLK: %s, %u Hz, Res: %.6f Hz, Freq: %.2f Hz)\n",
-                     dds::getMcoClockName(), dds::getMclkFreq(), dds::getResolution(), dds::getFrequency());
-  }
+
+  // Initialize Pulse Sonication Controller on PA5 (Hardware Timer TIM4)
+  sonication::begin();
+  DebugPort.println(F("Sonication Controller: Initialized on PA5 (TIM4 1ms HW Timer)"));
 
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising/Falling/Both edge trigger from configuration)
@@ -148,6 +153,20 @@ void loop()
   commandProccessor();
   processSerialDebugCommand();
   sendMonitorStream();
+  // Sonication status reporting only (UI progress). No interaction with the DPLL / generator.
+  {
+    static uint32_t s_lastSonicStatusMs = 0;
+    const uint32_t nowSonicMs = millis();
+    const bool changed = sonication::hasStateChanged();
+    if (changed || (nowSonicMs - s_lastSonicStatusMs >= 100U)) {
+      sonication::Status st = sonication::getStatus();
+      if (changed || st.state != sonication::STATE_IDLE) {
+        sonication::clearStateChanged();
+        s_lastSonicStatusMs = nowSonicMs;
+        com::sendPacket(OPCODE_GET_SONICATION_STATUS, 0, (const uint8_t *)&st, sizeof(st));
+      }
+    }
+  }
   com::FlushTxQueue(); // flush any pending packets to USB
   //debugPrint();
   heartbeat();
@@ -242,7 +261,7 @@ void commandProccessor()
         {
           float v = payloadFloat();
           if (v >= 0.0f && v <= 3.3f)
-            dpll::begin(v, dpll::getKp(), dpll::getKi(), dpll::getKd());
+            dpll::setCenterVoltage(v);
         }
         break;
       case OPCODE_GET_CENTER_VOLTAGE:
@@ -424,10 +443,13 @@ void commandProccessor()
           uint8_t src = pl[0];
           if (src <= 2)
           {
+            if (src == 1)
+            {
+              DebugPort.println(F("[DPLL] Source DDS (1) requested -> Auto-fallback to PWM Dither (2) (PA5 used for Sonication)"));
+            }
             dpll::setGeneratorSource((dpll::GeneratorSource)src);
-            const char* srcName = "DAC (CD4046)";
-            if (src == 1) srcName = "DDS (AD9833)";
-            else if (src == 2) srcName = "PWM Dither (TIM1 PA8)";
+            uint8_t actualSrc = (uint8_t)dpll::getGeneratorSource();
+            const char* srcName = (actualSrc == 0) ? "DAC (CD4046)" : "PWM Dither (TIM1 PA8)";
             DebugPort.printf("[DPLL] Generator source set to: %s\n", srcName);
           }
         }
@@ -533,6 +555,35 @@ void commandProccessor()
       {
         uint8_t dir = (uint8_t)dpll::getTrackingDirection();
         com::sendPacket(OPCODE_GET_TRACKING_DIR, 0, &dir, 1);
+        break;
+      }
+      case OPCODE_START_SONICATION:
+        if (plen >= 12)
+        {
+          uint32_t onTimeMs = 0, restTimeMs = 0, cycles = 0;
+          memcpy(&onTimeMs, pl, 4);
+          memcpy(&restTimeMs, pl + 4, 4);
+          memcpy(&cycles, pl + 8, 4);
+
+          // Sonication gate (PA5) is fully independent of the generator / DPLL tracking.
+          sonication::start(onTimeMs, restTimeMs, cycles);
+          sonication::Status st = sonication::getStatus();
+          com::sendPacket(OPCODE_GET_SONICATION_STATUS, 0, (const uint8_t *)&st, sizeof(st));
+          DebugPort.printf("[SONICATION] Started: On=%u ms, Rest=%u ms, Cycles=%u\n", onTimeMs, restTimeMs, cycles);
+        }
+        break;
+      case OPCODE_STOP_SONICATION:
+      {
+        sonication::stop();
+        sonication::Status st = sonication::getStatus();
+        com::sendPacket(OPCODE_GET_SONICATION_STATUS, 0, (const uint8_t *)&st, sizeof(st));
+        DebugPort.println(F("[SONICATION] Stopped / Aborted"));
+        break;
+      }
+      case OPCODE_GET_SONICATION_STATUS:
+      {
+        sonication::Status st = sonication::getStatus();
+        com::sendPacket(OPCODE_GET_SONICATION_STATUS, 0, (const uint8_t *)&st, sizeof(st));
         break;
       }
     }
@@ -749,17 +800,18 @@ void processDPLL()
   static bool     s_haveParkV = false;
   static bool     s_lockedThisPulse = false;
   static uint8_t  lockMissCount = 0;
-  // Lock needs a few in-window cycles only; large configured hold values
-  // (EEPROM default 10 = 200 ms) never completed within a 450 ms pulse.
-  constexpr uint32_t kMaxEffectiveHold = 5;
 
   // Restart / park value: clean steady locked centre, else clean end-of-pulse
-  // value, else the supplied fallback. All candidate values are bounded by a
-  // strict sanity check against calibrated center to prevent false-lock traps.
+  // value, else the supplied fallback. All candidate values are bounded by
+  // the configured limits.
   auto restartValue = [&](float fallbackV) -> float {
     float candidate = fallbackV;
     if (dpll::haveLockedCenter()) {
       candidate = dpll::getLockedCenterV();
+    } else if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_FREEZE && !dpll::isFreezeTimedOut()) {
+      candidate = dpll::isFrequencyGenerator()
+                ? dpll::lastFrequency()
+                : dpll::lastVoltage();
     } else {
       s_haveParkV = false;
       candidate = dpll::isFrequencyGenerator()
@@ -768,9 +820,10 @@ void processDPLL()
     }
 
     if (dpll::isFrequencyGenerator()) {
-      const float centerF = dpll::getDdsCenterFreq();
-      if (candidate <= 0.0f || fabsf(candidate - centerF) > 1500.0f) {
-        return centerF;
+      const float minF = dpll::getDdsMinFreq();
+      const float maxF = dpll::getDdsMaxFreq();
+      if (candidate < minF || candidate > maxF) {
+        return dpll::getDdsCenterFreq();
       }
     } else {
       const float centerV = dpll::getCenterVoltage();
@@ -805,7 +858,7 @@ void processDPLL()
 
   // Manual override: loop disengaged
   if (dpll::getManualMode()) {
-    digitalWrite(LOCK_INDICATOR_LED, LOW);
+    digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
@@ -839,8 +892,8 @@ void processDPLL()
           s_haveParkV = false;
           dpll::clearLockedCenter();
         }
-      } else if (!dpll::haveLockedCenter()) {
-        // Only reset if no valid lock memory exists from this or previous pulses
+      } else if (!dpll::haveLockedCenter() && dpll::getSignalLossBehavior() != dpll::SIGNAL_LOSS_FREEZE) {
+        // Only reset if not in FREEZE mode and no valid lock memory exists
         s_haveParkV = false;
         dpll::clearLockedCenter();
         dpll::reset();
@@ -854,16 +907,16 @@ void processDPLL()
     lockMissCount = 0;
     s_lockedThisPulse = false;
     if (nowMs - s_lastLockMs >= 500U) {
-      digitalWrite(LOCK_INDICATOR_LED, LOW);
+      digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
     }
     lockHoldCount = 0;
     unlockHoldCount = 0;
     railClampCount = 0;
     trackCycles = 0;
 
-    const bool wasLockedCenter = dpll::haveLockedCenter();
+    const bool wasTimedOut = dpll::isFreezeTimedOut();
     dpll::tickSignalAbsent(nowMs);
-    if (wasLockedCenter && !dpll::haveLockedCenter()) {
+    if (!wasTimedOut && dpll::isFreezeTimedOut()) {
       s_haveParkV = false;
       s_holdPhaseNs = dpll::getTargetPhase();
       s_lastGoodPhase = dpll::getTargetPhase();
@@ -874,15 +927,15 @@ void processDPLL()
     switch (dpll::getSignalLossBehavior())
     {
       case dpll::SIGNAL_LOSS_CENTER:
-        dpll::reset();       // DAC -> centerVoltage, clear integral
+        dpll::reset();       // DAC -> centerVoltage / Freq -> centerFreq, clear integral
         dpll::enable(false);
         break;
       case dpll::SIGNAL_LOSS_ZERO:
-        dpll::shutdown();    // DAC -> 0 V
+        dpll::shutdown();    // DAC -> 0 V / Mute generator
         break;
       case dpll::SIGNAL_LOSS_FREEZE:
       default:
-        if (dpll::haveLockedCenter() && s_haveParkV) {
+        if (dpll::haveLockedCenter() && s_haveParkV && !dpll::isFreezeTimedOut()) {
           // Park at the confirmed operating point near resonance while lock memory is valid.
           const float parkV = restartValue(dpll::getCenterVoltage());
           if (dpll::isFrequencyGenerator()) {
@@ -890,11 +943,8 @@ void processDPLL()
           } else {
             dpll::restartAtVoltage(parkV);
           }
-        } else {
-          // Lock memory expired (or pulse never locked): revert directly to neutral center!
-          dpll::reset();
         }
-        dpll::enable(false); // Hold last locked voltage / frequency
+        dpll::enable(false); // Hold last output voltage / frequency (or center if timed out)
         break;
     }
     phase_capture::clearWindowData();
@@ -903,22 +953,21 @@ void processDPLL()
     return;
   }
 
-  // Signal is valid
-  dpll::tickSignalAbsent(0); // Signal present
-
   // State Transition & Re-acquisition logic
   if (s_dpllState == STATE_NO_SIGNAL) {
-    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER || !dpll::haveLockedCenter()) {
+    if (dpll::getSignalLossBehavior() == dpll::SIGNAL_LOSS_CENTER ||
+        dpll::isFreezeTimedOut() ||
+        (dpll::getSignalLossBehavior() != dpll::SIGNAL_LOSS_FREEZE && !dpll::haveLockedCenter())) {
       dpll::reset();
       DebugPort.printf("[DPLL] Re-acquire: reset to center\n");
     } else {
-      // FREEZE / Resume: start exactly from the locked center point
+      // FREEZE / Resume (within timeout): start from the locked center point (or held frequency/voltage)
       if (dpll::isFrequencyGenerator()) {
-        float resumeF = restartValue(dpll::getDdsCenterFreq());
+        float resumeF = restartValue(dpll::lastFrequency());
         dpll::restartAtFrequency(resumeF);
         DebugPort.printf("[DPLL] Re-acquire: resume at Freq: %.1f Hz\n", resumeF);
       } else {
-        float resumeV = restartValue(dpll::getCenterVoltage());
+        float resumeV = restartValue(dpll::lastVoltage());
         dpll::restartAtVoltage(resumeV);
         DebugPort.printf("[DPLL] Re-acquire: resume at %.3f V (Freq: %.1f Hz)\n", resumeV, data.frequencyHz);
       }
@@ -937,6 +986,9 @@ void processDPLL()
     s_haveFilteredPhase = false;
     phase_capture::resetFilterState();
   }
+
+  // Signal is valid
+  dpll::tickSignalAbsent(0); // Clear absent / freeze-timeout state
 
   // Ignore the start-up transient windows of each pulse (no PID update).
   // Transducer acoustic ring-up: wait ~15-20 ms regardless of loop period.
@@ -985,7 +1037,7 @@ void processDPLL()
         if (unlockHoldCount >= 3) {
           s_dpllState = STATE_TRACKING;
           if (nowMs - s_lastLockMs >= 500U) {
-            digitalWrite(LOCK_INDICATOR_LED, LOW);
+            digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
           }
           lockHoldCount = 0;
         }
@@ -1000,13 +1052,11 @@ void processDPLL()
   }
   (void)pulseStart;
 
-  // Pulse-end glitch guard: shortly after lock, a phase jump of several
-  // microseconds is never real (locked sigma ~ tens of ns); it is the dying
-  // ZCD at the end of a sonication pulse. Do not let it move the DAC.
-  // A persistent step (>= 4 cycles) is accepted as real.
+  // Pulse-end glitch guard: when already LOCKED and the window filter had to
+  // fall back (untrusted window), reject sudden large phase jumps (dying ZCD).
+  // Trusted windows are never skipped so PID steps respond immediately every cycle.
+  if (usedFallback)
   {
-    // Glitch guard: reject dying pulse transient and start-up acoustic transient.
-    // A persistent step (>= 4 cycles) is accepted as real.
     const bool haveGood = (s_goodCount >= 2);
     const float kJumpThr = (s_dpllState == STATE_LOCKED)
                          ? fmaxf(1.5f * kLockThr, 600.0f)
@@ -1014,14 +1064,6 @@ void processDPLL()
     bool glitch = false;
     if (haveGood) {
       glitch = fabsf(filteredPhaseNs - s_lastGoodPhase) > kJumpThr;
-    } else {
-      // Pulse start: compare with last good phase (or target) to reject start-up acoustic transient.
-      // If resuming from a confirmed locked operating point, start phase should be close to reference.
-      const float refPhase = (s_lastGoodPhase != 0.0f) ? s_lastGoodPhase : dpll::getTargetPhase();
-      const float kStartGate = dpll::haveLockedCenter()
-                             ? fmaxf(1.5f * kLockThr, 600.0f)
-                             : fmaxf(2.5f * kLockThr, 1200.0f);
-      glitch = fabsf(filteredPhaseNs - refPhase) > kStartGate;
     }
     if (glitch && glitchSkipCount < 4) {
       glitchSkipCount++;
@@ -1029,6 +1071,8 @@ void processDPLL()
       lastDacUpdate = millis();
       return;
     }
+    glitchSkipCount = 0;
+  } else {
     glitchSkipCount = 0;
   }
 
@@ -1108,8 +1152,7 @@ void processDPLL()
       lockHoldCount++;
       const uint32_t configuredHold = dpll::getLockHoldCycles();
       const uint32_t minHold = (dpll::getLoopPeriodMs() >= 20U) ? 1U : 2U;
-      const uint32_t holdNeed = (configuredHold < minHold) ? minHold :
-                              (configuredHold > kMaxEffectiveHold ? kMaxEffectiveHold : configuredHold);
+      const uint32_t holdNeed = (configuredHold < minHold) ? minHold : configuredHold;
       if (lockHoldCount >= holdNeed) {
         s_dpllState = STATE_LOCKED;
         s_lockedThisPulse = true;
@@ -1135,10 +1178,9 @@ void processDPLL()
     static uint32_t lastDiagMs = 0;
     if (nowMs - lastDiagMs >= 500U) {
       lastDiagMs = nowMs;
-      DebugPort.printf("[DPLL DIAG] win=%.0f ns tgt=%.0f thr=%.0f hold=%u/%u(cfg %u) %s%s\n",
+      DebugPort.printf("[DPLL DIAG] win=%.0f ns tgt=%.0f thr=%.0f hold=%u/%u %s%s\n",
                        filteredPhaseNs, dpll::getTargetPhase(), kLockThr,
-                       (unsigned)lockHoldCount, (unsigned)kMaxEffectiveHold,
-                       (unsigned)dpll::getLockHoldCycles(),
+                       (unsigned)lockHoldCount, (unsigned)dpll::getLockHoldCycles(),
                        s_dpllState == STATE_LOCKED ? "LOCKED" : "TRACK",
                        usedFallback ? " fallback" : "");
     }
@@ -1147,9 +1189,9 @@ void processDPLL()
   // Update hardware lock indicator LED (active high with 500 ms pulse-stretcher)
   if (s_dpllState == STATE_LOCKED) {
     s_lastLockMs = nowMs;
-    digitalWrite(LOCK_INDICATOR_LED, HIGH);
+    digitalWriteFast(LOCK_INDICATOR_LED_PN, HIGH);
   } else if (nowMs - s_lastLockMs >= 500U) {
-    digitalWrite(LOCK_INDICATOR_LED, LOW);
+    digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
   }
 
   phase_capture::clearWindowData();
@@ -1350,12 +1392,12 @@ void handleDebugCommand(const String &cmd)
   {
     if (arg == "on" || arg == "1")
     {
-      digitalWrite(LOCK_INDICATOR_LED, HIGH);
+      digitalWriteFast(LOCK_INDICATOR_LED_PN, HIGH);
       DebugPort.println(F("LOCK LED (PC10) set to HIGH (ON)"));
     }
     else if (arg == "off" || arg == "0")
     {
-      digitalWrite(LOCK_INDICATOR_LED, LOW);
+      digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
       DebugPort.println(F("LOCK LED (PC10) set to LOW (OFF)"));
     }
     else
@@ -1915,6 +1957,6 @@ void heartbeat()
   if (currentTime - lastToggleTime >= 500)
   {
     lastToggleTime = currentTime;
-    digitalToggle(HEARTBEAT_LED);
+    digitalToggleFast(HEARTBEAT_LED_PN);
   }
 }

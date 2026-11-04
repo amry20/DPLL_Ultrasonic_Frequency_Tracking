@@ -720,6 +720,13 @@ void clearWindowData()
   interrupts();
 }
 
+void notifyFrequencyCommand()
+{
+  s_stableRefMs = 0U; // Re-seed the pulse-end reference from the next measurement
+  s_haveTrustedWindow = false;
+  s_haveShiftCandidate = false;
+}
+
 void resetFilterState()
 {
   s_haveTrustedWindow = false;

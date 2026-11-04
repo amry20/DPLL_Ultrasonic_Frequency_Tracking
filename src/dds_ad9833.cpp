@@ -39,8 +39,8 @@ namespace dds
         const McoClockInfo &info = s_clockTable[clockSel];
         s_currentMclkHz = info.freqHz;
 
-        // 1. Configure PA8 as MCO1 hardware clock output with chosen source & prescaler
-        HAL_RCC_MCOConfig(RCC_MCO1, info.rccSource, info.rccDiv);
+        // NOTE: PA8 is dedicated to TIM1_CH1 PWM Dithering output.
+        // Do NOT call HAL_RCC_MCOConfig(RCC_MCO1, ...) here, as that would hijack PA8 to AF0 (MCO1)!
 
         // 2. Update AD9833 reference frequency so frequency calculations use the new clock
         s_dds.SetRefClock(s_currentMclkHz);

@@ -102,6 +102,10 @@ void clearWindowData();
 // Reset robust filter state (anchor, shift candidates) so a new pulse immediately acquires
 void resetFilterState();
 
+// Tell the capture layer that the generator frequency was just commanded to a new value,
+// so the next measured frequency step must not be mistaken for a pulse-end (idle-frequency) jump.
+void notifyFrequencyCommand();
+
 // Helper: convert TIM2 ticks to microseconds
 float ticksToUs(uint32_t ticks);
 

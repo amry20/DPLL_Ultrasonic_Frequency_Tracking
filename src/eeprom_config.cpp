@@ -123,6 +123,19 @@ namespace eeprom_config
             {
                 dpll::setGeneratorSource((dpll::GeneratorSource)cfg.generatorSource);
             }
+            if (cfg.generatorSource == 1 || cfg.generatorSource == 2)
+            {
+                // Auto-heal legacy EEPROM configs where resetConfig()/setup() accidentally saved DAC gains/slew into PWM Dither mode
+                if (cfg.ddsMaxSlew <= 100.0f)
+                {
+                    cfg.ddsMaxSlew = 20000.0f;
+                }
+                if (cfg.kp > 0.0f && cfg.kp <= 0.00001f && cfg.ki > 0.0f && cfg.ki <= 0.001f)
+                {
+                    cfg.kp = 0.01f;
+                    cfg.ki = 0.1f;
+                }
+            }
             dpll::setDdsFreqLimits(cfg.ddsMinFreq, cfg.ddsMaxFreq);
             dpll::setDdsMaxSlew(cfg.ddsMaxSlew);
             dpll::setDdsCenterFreq(cfg.ddsCenterFreq);
@@ -228,19 +241,25 @@ namespace eeprom_config
         bool ok = eraseConfig();
 
         // Restore factory baseline configuration to DPLL controller & hardware peripherals
+        // 1. Set DAC mode baseline gains & slew first
+        dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_DAC);
+        dpll::setGains(0.000002f, 0.0002f);
+        dpll::setKd(0.0f);
+        dpll::setOutputLimits(0.0f, 3.3f);
+        dpll::setMaxSlew(30.0f);
+
+        // 2. Switch to default PWM Dither mode and set frequency baseline gains & slew
         dpll::setGeneratorSource(dpll::GENERATOR_SOURCE_PWM_DITHER);
         dpll::setDdsFreqLimits(20000.0f, 40000.0f);
         dpll::setDdsMaxSlew(20000.0f);
         dpll::setDdsCenterFreq(28000.0f);
         dds::setMcoClock(dds::MCO_CLOCK_HSE_8MHZ);
 
-        dpll::begin(1.65f, 0.000002f, 0.0002f, 0.0f);
-        dpll::setTargetPhase(0.0f);
-        dpll::setOutputLimits(0.0f, 3.3f);
-        dpll::setMaxSlew(30.0f);
+        dpll::begin(1.65f, 0.01f, 0.1f, 0.0f);
+        dpll::setTargetPhase(600.0f);
         dpll::setLoopPeriodMs(20);
         dpll::setLockThresholdNs(500.0f);
-        dpll::setLockHoldCycles(10);
+        dpll::setLockHoldCycles(2);
         dpll::setLockMemoryTimeoutMs(5000);
         dpll::setStreamPeriodMs(10);
         dpll::setSignalLossBehavior(dpll::SIGNAL_LOSS_FREEZE);

@@ -74,6 +74,9 @@ namespace dpll
     // Set the phase delay the loop should lock onto, in nanoseconds (default 0).
     void setTargetPhase(float targetNs);
 
+    // Update the nominal DAC center voltage without resetting the active frequency loop.
+    void setCenterVoltage(float centerV);
+
     // Update the PI gains at runtime.
     void setGains(float kp, float ki);
 
@@ -162,6 +165,7 @@ namespace dpll
     // Called by main loop every cycle when signal is absent.
     // Internally tracks elapsed absent time and clears locked center on timeout.
     void     tickSignalAbsent(uint32_t nowMs);
+    bool     isFreezeTimedOut();
 
     // Monitor stream rate in milliseconds (1–65535). Default 100 ms = 10 Hz.
     // sendMonitorStream() uses this to decouple stream rate from settling window.
