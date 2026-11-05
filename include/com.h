@@ -46,6 +46,19 @@ typedef struct dpllStatusData
     uint8_t EepromStatus;          // 1 byte  (0=Not detected / error, 1=Connected & OK)
     uint8_t DdsStatus;             // 1 byte  (0=Error, 1=Ready/OK, 2=Signal Verified)
 }__attribute__((packed)) dpllStatusData;
+
+typedef struct BodeSweepPointPacket
+{
+    uint8_t  state;          // 0=IDLE/COMPLETED, 1=RUNNING, 2=ABORTED
+    uint8_t  valid;          // 1=valid ZCD phase captured, 0=no ZCD
+    uint16_t stepIndex;      // 1-based step index
+    uint16_t totalSteps;     // total steps in sweep
+    uint16_t sampleCount;    // accepted ZCD samples in window
+    float    targetFreqHz;   // commanded generator frequency (Hz)
+    float    measuredFreqHz; // measured REF frequency (Hz)
+    float    phaseDiffNs;    // measured phase difference (ns)
+    float    phaseDegrees;   // measured phase difference (deg)
+} __attribute__((packed)) BodeSweepPointPacket;
 namespace com
 {
     void begin();

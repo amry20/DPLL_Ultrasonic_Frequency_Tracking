@@ -56,6 +56,8 @@ extern "C" void SystemClock_Config(void)
 void heartbeat();
 void processSerialDebugCommand();
 void processDPLL();
+void processBodeSweep();
+bool isBodeSweepActive();
 void debugPrint();
 void sendMonitorStream();
 void commandProccessor();
@@ -148,6 +150,7 @@ void setup()
 
 void loop()
 {
+  processBodeSweep();
   processDPLL();
   com::receive_command();
   commandProccessor();
@@ -586,6 +589,26 @@ void commandProccessor()
         com::sendPacket(OPCODE_GET_SONICATION_STATUS, 0, (const uint8_t *)&st, sizeof(st));
         break;
       }
+      case OPCODE_START_BODE_SWEEP:
+        if (plen >= 20)
+        {
+          float startF = 0.0f, stopF = 0.0f, stepF = 0.0f;
+          uint32_t pulseOnMs = 0, restGapMs = 0;
+          memcpy(&startF, pl, 4);
+          memcpy(&stopF, pl + 4, 4);
+          memcpy(&stepF, pl + 8, 4);
+          memcpy(&pulseOnMs, pl + 12, 4);
+          memcpy(&restGapMs, pl + 16, 4);
+          extern void startBodeSweep(float startFreq, float stopFreq, float stepFreq, uint32_t pulseOnMs, uint32_t restGapMs);
+          startBodeSweep(startF, stopF, stepF, pulseOnMs, restGapMs);
+        }
+        break;
+      case OPCODE_STOP_BODE_SWEEP:
+      {
+        extern void stopBodeSweep();
+        stopBodeSweep();
+        break;
+      }
     }
   }
 }
@@ -656,7 +679,7 @@ void sendMonitorStream()
   }
   float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
 
-  const bool isSignalActive = (s_dpllState != STATE_NO_SIGNAL);
+  const bool isSignalActive = (s_dpllState != STATE_NO_SIGNAL) || dpll::getManualMode();
   const bool isPhaseValid   = isSignalActive && data.valid;
 
   // Phase value reported: prefer robust filtered window phase when active.
@@ -836,6 +859,11 @@ void processDPLL()
 
   uint32_t nowMs = millis();
 
+  if (isBodeSweepActive()) {
+    lastDacUpdate = nowMs;
+    return;
+  }
+
   if (firstRun) {
     phase_capture::clearWindowData();
     lastDacUpdate = nowMs;
@@ -856,9 +884,20 @@ void processDPLL()
   phase_capture::PhaseWindowData window = phase_capture::consumeWindowData();
   const float kLockThr = dpll::getLockThresholdNs();
 
-  // Manual override: loop disengaged
+  // Manual override: loop disengaged, but still update filtered phase for live telemetry
   if (dpll::getManualMode()) {
     digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
+    if (data.valid) {
+      if (window.phaseComputed && window.sampleCount >= 2) {
+        s_latestFilteredPhaseNs = window.phaseDiffNs;
+        s_haveFilteredPhase = true;
+      } else {
+        s_latestFilteredPhaseNs = data.phaseDiffNs;
+        s_haveFilteredPhase = true;
+      }
+    } else {
+      s_haveFilteredPhase = false;
+    }
     phase_capture::clearWindowData();
     lastDacUpdate = millis();
     return;
@@ -1958,5 +1997,235 @@ void heartbeat()
   {
     lastToggleTime = currentTime;
     digitalToggleFast(HEARTBEAT_LED_PN);
+  }
+}
+
+// ===========================================================================
+// Firmware-Driven Phase Response (Bode Plot) Sweep State Machine
+// ===========================================================================
+namespace {
+enum BodeSweepPhase : uint8_t {
+  BODE_IDLE = 0,
+  BODE_PRE_FREQ_SETTLE,  // Wait 5 ms after setting frequency before turning on PA5
+  BODE_PULSE_RINGUP,     // Wait acoustic ring-up settle time inside the PA5 pulse
+  BODE_PULSE_CAPTURE,    // Collect steady-state ZCD phase samples while PA5 is still HIGH
+  BODE_REST_GAP          // Wait restGapMs with PA5 LOW before next frequency step
+};
+
+BodeSweepPhase s_bodePhase       = BODE_IDLE;
+float          s_bodeStartFreq   = 20000.0f;
+float          s_bodeStopFreq    = 40000.0f;
+float          s_bodeStepFreq    = 100.0f;
+float          s_bodeCurrentFreq = 20000.0f;
+uint32_t       s_bodePulseOnMs   = 60U;
+uint32_t       s_bodeRestGapMs   = 150U;
+uint16_t       s_bodeStepIndex   = 0U;
+uint16_t       s_bodeTotalSteps  = 0U;
+uint32_t       s_bodePhaseMs     = 0U;
+} // namespace
+
+bool isBodeSweepActive()
+{
+  return s_bodePhase != BODE_IDLE;
+}
+
+void startBodeSweep(float startFreq, float stopFreq, float stepFreq, uint32_t pulseOnMs, uint32_t restGapMs)
+{
+  if (isnan(startFreq) || isnan(stopFreq) || isnan(stepFreq) ||
+      startFreq < 1000.0f || stopFreq > 500000.0f || stopFreq < startFreq || stepFreq < 0.5f)
+  {
+    DebugPort.println(F("[BODE] Invalid sweep parameters"));
+    return;
+  }
+
+  if (pulseOnMs < 15U) pulseOnMs = 15U;
+  if (pulseOnMs > 10000U) pulseOnMs = 10000U;
+  if (restGapMs < 10U) restGapMs = 10U;
+  if (restGapMs > 30000U) restGapMs = 30000U;
+
+  uint32_t steps = (uint32_t)floorf((stopFreq - startFreq) / stepFreq + 1.0001f);
+  if (steps < 1U) steps = 1U;
+  if (steps > 5000U) steps = 5000U;
+
+  sonication::stop();
+
+  s_bodeStartFreq   = startFreq;
+  s_bodeStopFreq    = stopFreq;
+  s_bodeStepFreq    = stepFreq;
+  s_bodePulseOnMs   = pulseOnMs;
+  s_bodeRestGapMs   = restGapMs;
+  s_bodeStepIndex   = 1U;
+  s_bodeTotalSteps  = (uint16_t)steps;
+  s_bodeCurrentFreq = startFreq;
+
+  // Disengage closed-loop PID and set first frequency
+  dpll::setManualMode(true);
+  dpll::manualSetFreq(s_bodeCurrentFreq);
+
+  s_bodePhase   = BODE_PRE_FREQ_SETTLE;
+  s_bodePhaseMs = millis();
+
+  DebugPort.printf("[BODE] Started: %.1f -> %.1f Hz (step=%.1f Hz, %u steps, pulse=%u ms, gap=%u ms)\n",
+                   startFreq, stopFreq, stepFreq, (unsigned)steps, (unsigned)pulseOnMs, (unsigned)restGapMs);
+}
+
+void stopBodeSweep()
+{
+  if (s_bodePhase == BODE_IDLE) return;
+
+  sonication::stop();
+
+  BodeSweepPointPacket pkt{};
+  pkt.state          = 2U; // ABORTED
+  pkt.valid          = 0U;
+  pkt.stepIndex      = s_bodeStepIndex;
+  pkt.totalSteps     = s_bodeTotalSteps;
+  pkt.sampleCount    = 0U;
+  pkt.targetFreqHz   = s_bodeCurrentFreq;
+  pkt.measuredFreqHz = s_bodeCurrentFreq;
+  pkt.phaseDiffNs    = 0.0f;
+  pkt.phaseDegrees   = 0.0f;
+  com::sendPacket(OPCODE_BODE_SWEEP_POINT, 0, (const uint8_t *)&pkt, sizeof(pkt));
+
+  s_bodePhase = BODE_IDLE;
+
+  // Restore DPLL closed-loop control at configured center frequency
+  dpll::setManualMode(false);
+  dpll::reset();
+  dpll::enable(true);
+
+  DebugPort.println(F("[BODE] Aborted -> Restored closed-loop DPLL"));
+}
+
+void processBodeSweep()
+{
+  if (s_bodePhase == BODE_IDLE) return;
+
+  const uint32_t nowMs     = millis();
+  const uint32_t elapsedMs = nowMs - s_bodePhaseMs;
+
+  // Reserve 2 ms before the end of pulseOnMs so measurement completes while PA5 is still HIGH.
+  // Also cap the active capture window to at most 35 ms (~1150 cycles at 33 kHz) at the tail of the pulse
+  // so kMaxWindowSamples (1536 samples) never overflows on long pulses (e.g. 250 ms) and always measures
+  // fully-developed steady-state cavitation.
+  const uint32_t effectivePulseMs = (s_bodePulseOnMs > 4U) ? (s_bodePulseOnMs - 2U) : s_bodePulseOnMs;
+  uint32_t ringupMs = (effectivePulseMs * 40U) / 100U;
+  if (effectivePulseMs > 45U && (effectivePulseMs - ringupMs) > 35U) {
+    ringupMs = effectivePulseMs - 35U;
+  }
+  if (ringupMs < 6U) ringupMs = 6U;
+  if (effectivePulseMs > 10U && ringupMs > (effectivePulseMs - 8U)) {
+    ringupMs = effectivePulseMs - 8U;
+  }
+
+  switch (s_bodePhase)
+  {
+    case BODE_PRE_FREQ_SETTLE:
+      if (elapsedMs >= 5U) {
+        // Trigger 1 short sonication pulse on PA5
+        sonication::start(s_bodePulseOnMs, 0U, 1U);
+        s_bodePhaseMs = nowMs;
+        s_bodePhase   = BODE_PULSE_RINGUP;
+      }
+      break;
+
+    case BODE_PULSE_RINGUP:
+      if (elapsedMs >= ringupMs) {
+        // Acoustic ring-up complete; clear capture window to collect clean steady-state ZCD edges
+        phase_capture::resetFilterState();
+        phase_capture::clearWindowData();
+        s_bodePhase = BODE_PULSE_CAPTURE;
+      }
+      break;
+
+    case BODE_PULSE_CAPTURE:
+      if (elapsedMs >= effectivePulseMs) {
+        // Consume phase window while PA5 is still HIGH (before dying-pulse ringdown)
+        phase_capture::CaptureData cap = phase_capture::getData();
+        phase_capture::PhaseWindowData win = phase_capture::consumeWindowData();
+        phase_capture::clearWindowData();
+
+        // Turn off PA5 immediately now that measurement is complete
+        sonication::stop();
+
+        float measuredFreq = (cap.refValid && cap.frequencyHz > 1.0f) ? cap.frequencyHz : s_bodeCurrentFreq;
+        float phaseNs      = 0.0f;
+        float phaseDeg     = 0.0f;
+        uint16_t samples   = 0U;
+        uint8_t isValid    = 0U;
+
+        if (win.phaseComputed && win.sampleCount >= 2U) {
+          phaseNs  = win.phaseDiffNs;
+          phaseDeg = win.phaseDegrees;
+          samples  = (win.acceptedCount > 0U) ? win.acceptedCount : win.sampleCount;
+          isValid  = 1U;
+        } else if (cap.valid) {
+          phaseNs  = cap.phaseDiffNs;
+          phaseDeg = (measuredFreq > 1.0f) ? (cap.phaseDiffNs * measuredFreq * 360.0e-9f) : 0.0f;
+          while (phaseDeg > 180.0f)  phaseDeg -= 360.0f;
+          while (phaseDeg < -180.0f) phaseDeg += 360.0f;
+          samples  = 1U;
+          isValid  = 1U;
+        }
+
+        s_latestCaptureData = cap;
+        if (isValid) {
+          s_latestFilteredPhaseNs = phaseNs;
+          s_haveFilteredPhase     = true;
+          s_holdPhaseNs           = phaseNs;
+        } else {
+          s_haveFilteredPhase     = false;
+        }
+
+        const bool isLastStep = (s_bodeStepIndex >= s_bodeTotalSteps);
+
+        BodeSweepPointPacket pkt{};
+        pkt.state          = isLastStep ? 0U : 1U; // 0=COMPLETED, 1=RUNNING
+        pkt.valid          = isValid;
+        pkt.stepIndex      = s_bodeStepIndex;
+        pkt.totalSteps     = s_bodeTotalSteps;
+        pkt.sampleCount    = samples;
+        pkt.targetFreqHz   = s_bodeCurrentFreq;
+        pkt.measuredFreqHz = measuredFreq;
+        pkt.phaseDiffNs    = phaseNs;
+        pkt.phaseDegrees   = phaseDeg;
+        com::sendPacket(OPCODE_BODE_SWEEP_POINT, 0, (const uint8_t *)&pkt, sizeof(pkt));
+
+        DebugPort.printf("[BODE %u/%u] Target=%.1f Hz | Meas=%.2f Hz | Phase=%.2f deg (%.1f ns) | N=%u %s\n",
+                         (unsigned)s_bodeStepIndex, (unsigned)s_bodeTotalSteps,
+                         s_bodeCurrentFreq, measuredFreq, phaseDeg, phaseNs,
+                         (unsigned)samples, isValid ? "OK" : "NO_ZCD");
+
+        if (isLastStep) {
+          s_bodePhase = BODE_IDLE;
+          // Restore closed-loop DPLL operation
+          dpll::setManualMode(false);
+          dpll::reset();
+          dpll::enable(true);
+          DebugPort.println(F("[BODE] Sweep completed -> Restored closed-loop DPLL"));
+        } else {
+          s_bodePhaseMs = millis();
+          s_bodePhase   = BODE_REST_GAP;
+        }
+      }
+      break;
+
+    case BODE_REST_GAP:
+      if (elapsedMs >= s_bodeRestGapMs) {
+        s_bodeStepIndex++;
+        float nextFreq = s_bodeStartFreq + (float)(s_bodeStepIndex - 1U) * s_bodeStepFreq;
+        if (nextFreq > s_bodeStopFreq || s_bodeStepIndex == s_bodeTotalSteps) {
+          nextFreq = s_bodeStopFreq;
+        }
+        s_bodeCurrentFreq = nextFreq;
+        dpll::manualSetFreq(s_bodeCurrentFreq);
+        s_bodePhaseMs = millis();
+        s_bodePhase   = BODE_PRE_FREQ_SETTLE;
+      }
+      break;
+
+    default:
+      s_bodePhase = BODE_IDLE;
+      break;
   }
 }

@@ -558,8 +558,8 @@ void manualSetFreq(float freqHz)
   if (!isFrequencyGenerator()) {
     s_generatorSource = GENERATOR_SOURCE_PWM_DITHER;
   }
-  if (freqHz < s_ddsMinFreq) freqHz = s_ddsMinFreq;
-  if (freqHz > s_ddsMaxFreq) freqHz = s_ddsMaxFreq;
+  if (freqHz < 1000.0f) freqHz = 1000.0f;
+  if (freqHz > 500000.0f) freqHz = 500000.0f;
   s_outputFreq = freqHz;
   dac::setVoltage(1.65f); // Park DAC safely at 1.65 V neutral
   if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {
