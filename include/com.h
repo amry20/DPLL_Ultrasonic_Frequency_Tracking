@@ -41,23 +41,25 @@ typedef struct dpllStatusData
     float   ReferenceFrequencyHz;  // 4 bytes — all floats first, naturally aligned
     float   PhaseError_ns;         // 4 bytes (last-valid value when PhaseStale=1)
     float   DACVoltage_V;          // 4 bytes
+    float   CurrentMagnitude_mA;   // 4 bytes — Transducer peak current magnitude from Goertzel (mA)
     uint8_t LockStatus;            // 1 byte  (0=NO_REF, 1=WAIT_ZCD, 2=TRACK, 3=LOCK)
-    uint8_t PhaseStale;            // 1 byte  (0=fresh measurement, 1=ZCD absent, using last valid)
+    uint8_t PhaseStale;            // 1 byte  (0=fresh measurement, 1=ZCD/Goertzel absent)
     uint8_t EepromStatus;          // 1 byte  (0=Not detected / error, 1=Connected & OK)
     uint8_t DdsStatus;             // 1 byte  (0=Error, 1=Ready/OK, 2=Signal Verified)
 }__attribute__((packed)) dpllStatusData;
 
 typedef struct BodeSweepPointPacket
 {
-    uint8_t  state;          // 0=IDLE/COMPLETED, 1=RUNNING, 2=ABORTED
-    uint8_t  valid;          // 1=valid ZCD phase captured, 0=no ZCD
-    uint16_t stepIndex;      // 1-based step index
-    uint16_t totalSteps;     // total steps in sweep
-    uint16_t sampleCount;    // accepted ZCD samples in window
-    float    targetFreqHz;   // commanded generator frequency (Hz)
-    float    measuredFreqHz; // measured REF frequency (Hz)
-    float    phaseDiffNs;    // measured phase difference (ns)
-    float    phaseDegrees;   // measured phase difference (deg)
+    uint8_t  state;               // 0=IDLE/COMPLETED, 1=RUNNING, 2=ABORTED
+    uint8_t  valid;               // 1=valid phase captured, 0=no signal
+    uint16_t stepIndex;           // 1-based step index
+    uint16_t totalSteps;          // total steps in sweep
+    uint16_t sampleCount;         // accepted samples in window
+    float    targetFreqHz;        // commanded generator frequency (Hz)
+    float    measuredFreqHz;      // measured REF frequency (Hz)
+    float    phaseDiffNs;         // measured phase difference (ns)
+    float    phaseDegrees;        // measured phase difference (deg)
+    float    currentMagnitude_mA; // measured peak current amplitude (mA)
 } __attribute__((packed)) BodeSweepPointPacket;
 namespace com
 {

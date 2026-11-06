@@ -90,17 +90,18 @@ struct PhaseSample {
 // Double-buffered capture storage. The ISR writes only to the active bank.
 // consumeWindowData() swaps banks with interrupts briefly disabled, then does
 // all expensive work on the inactive bank while capture continues normally.
-PhaseSample       s_sampleBanks[2][kMaxWindowSamples]{};
+// Placed in CCMRAM for fast core access without consuming DMA-capable bus matrix SRAM.
+__attribute__((section(".ccmram"))) static PhaseSample s_sampleBanks[2][kMaxWindowSamples]{};
 volatile uint16_t s_bankCount[2]    = {0, 0};
 volatile bool     s_bankOverflow[2] = {false, false};
 volatile uint8_t  s_activeBank      = 0;
 
 // Static workspaces keep the MCU stack small and avoid heap allocation.
-float s_wrappedDeg[kMaxWindowSamples]{};
+__attribute__((section(".ccmram"))) static float s_wrappedDeg[kMaxWindowSamples]{};
 float s_unwrappedDeg[kMaxWindowSamples]{};
-float s_gradientDeg[kMaxWindowSamples]{};
+__attribute__((section(".ccmram"))) static float s_gradientDeg[kMaxWindowSamples]{};
 bool  s_gradientOutlier[kMaxWindowSamples]{};
-float s_sortScratch[kMaxWindowSamples]{};
+__attribute__((section(".ccmram"))) static float s_sortScratch[kMaxWindowSamples]{};
 
 float    s_blockTimeMs[kMaxBlocks]{};
 float    s_blockPhaseDeg[kMaxBlocks]{};

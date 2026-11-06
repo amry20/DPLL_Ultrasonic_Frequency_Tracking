@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "dac_output.h"
 #include "phase_capture.h"
+#include "goertzel_capture.h"
 #include "dpll_controller.h"
 #include "com.h"
 #include "eeprom_24lc16b.h"
@@ -65,6 +66,13 @@ void setupSerialDebug();
 // All loop-config state lives in dpll_controller (accessible via dpll:: getters/setters).
 // Default values are set there; use opcode or UART command to change at runtime.
 HardwareSerial DebugPort(PA10, PA9); // RX, TX
+
+enum PhaseSource : uint8_t {
+  PHASE_SOURCE_ZCD      = 0, // Input Capture on PA0 (REF) & PA1 (ZCD)
+  PHASE_SOURCE_GOERTZEL = 1  // Dual Simultaneous ADC on PC4 (Current) & PA7 (Drive Ref)
+};
+static PhaseSource s_phaseSource = PHASE_SOURCE_GOERTZEL; // Default to robust Goertzel front-end
+
 void setup()
 {
   setupSerialDebug();
@@ -141,6 +149,10 @@ void setup()
   sonication::begin();
   DebugPort.println(F("Sonication Controller: Initialized on PA5 (TIM4 1ms HW Timer)"));
 
+  // Initialize Goertzel Dual Simultaneous ADC Front-End on PC4 (Current) & PA7 (Drive Ref) @ 750 kSPS
+  goertzel_capture::begin();
+  DebugPort.println(F("Goertzel Dual ADC Front-End: Initialized on PC4 & PA7 (750 kSPS, TIM3 TRGO)"));
+
   // Initialize 32-bit Input Capture on TIM2:
   // PA0 = Reference input (Rising/Falling/Both edge trigger from configuration)
   // PA1 = ZCD feedback input (Rising/Falling/Both edge trigger from configuration)
@@ -150,6 +162,10 @@ void setup()
 
 void loop()
 {
+  // Continuously poll Goertzel ADC blocks at active generator drive frequency
+  const float currentDriveFreq = dpll::isFrequencyGenerator() ? dma_sqw::getFrequency() : dpll::getDdsCenterFreq();
+  goertzel_capture::poll(currentDriveFreq);
+
   processBodeSweep();
   processDPLL();
   com::receive_command();
@@ -609,6 +625,21 @@ void commandProccessor()
         stopBodeSweep();
         break;
       }
+      case OPCODE_SET_PHASE_SOURCE:
+        if (plen >= 1)
+        {
+          uint8_t src = pl[0];
+          s_phaseSource = (src == 0) ? PHASE_SOURCE_ZCD : PHASE_SOURCE_GOERTZEL;
+          DebugPort.printf("[DPLL] Phase Measurement Source set to: %s\n",
+                           s_phaseSource == PHASE_SOURCE_GOERTZEL ? "Goertzel Dual ADC (PC4/PA7)" : "ZCD Input Capture (PA0/PA1)");
+        }
+        break;
+      case OPCODE_GET_PHASE_SOURCE:
+      {
+        uint8_t src = (uint8_t)s_phaseSource;
+        com::sendPacket(OPCODE_GET_PHASE_SOURCE, 0, &src, 1);
+        break;
+      }
     }
   }
 }
@@ -724,8 +755,9 @@ void sendMonitorStream()
   }
   status.ReferenceFrequencyHz = data.frequencyHz;
   status.PhaseError_ns        = currentPhaseNs;
-  status.PhaseStale           = isPhaseValid ? 0 : 1;
   status.DACVoltage_V         = currentDacV;
+  status.CurrentMagnitude_mA  = goertzel_capture::getMetrics().currentAmpA * 1000.0f; // Peak current in mA
+  status.PhaseStale           = isPhaseValid ? 0 : 1;
 
   static uint32_t s_lastEepromCheck = 0;
   static uint8_t s_eepromStatus = 0;
@@ -884,17 +916,25 @@ void processDPLL()
   phase_capture::PhaseWindowData window = phase_capture::consumeWindowData();
   const float kLockThr = dpll::getLockThresholdNs();
 
+  // Signal validation based on selected measurement source
+  const goertzel_capture::GoertzelMetrics gMetrics = goertzel_capture::getMetrics();
+  bool signalValid = false;
+  float activePhaseNs = 0.0f;
+
+  if (s_phaseSource == PHASE_SOURCE_GOERTZEL) {
+    signalValid   = gMetrics.valid;
+    activePhaseNs = gMetrics.phaseDiffNs;
+  } else {
+    signalValid   = data.valid;
+    activePhaseNs = (window.phaseComputed && window.sampleCount >= 2) ? window.phaseDiffNs : data.phaseDiffNs;
+  }
+
   // Manual override: loop disengaged, but still update filtered phase for live telemetry
   if (dpll::getManualMode()) {
     digitalWriteFast(LOCK_INDICATOR_LED_PN, LOW);
-    if (data.valid) {
-      if (window.phaseComputed && window.sampleCount >= 2) {
-        s_latestFilteredPhaseNs = window.phaseDiffNs;
-        s_haveFilteredPhase = true;
-      } else {
-        s_latestFilteredPhaseNs = data.phaseDiffNs;
-        s_haveFilteredPhase = true;
-      }
+    if (signalValid) {
+      s_latestFilteredPhaseNs = activePhaseNs;
+      s_haveFilteredPhase = true;
     } else {
       s_haveFilteredPhase = false;
     }
@@ -904,7 +944,7 @@ void processDPLL()
   }
 
   // Check signal presence
-  if (!data.valid) {
+  if (!signalValid) {
     const bool wasActive = (s_dpllState != STATE_NO_SIGNAL);
     s_dpllState = STATE_NO_SIGNAL;
     glitchSkipCount = 0;
@@ -1044,10 +1084,13 @@ void processDPLL()
   // Bypass window rejection at the start of a pulse (trackCycles < 2) so the DPLL
   // immediately begins tracking without wasting 40-60 ms of a 450 ms sonication pulse.
   bool pulseStart = (trackCycles < 2);
-  float filteredPhaseNs = window.phaseDiffNs;
+  float filteredPhaseNs = activePhaseNs;
   bool usedFallback = false;
 
-  if (!window.trustworthy) {
+  if (s_phaseSource == PHASE_SOURCE_GOERTZEL) {
+    filteredPhaseNs = gMetrics.phaseDiffNs;
+    usedFallback = false; // Goertzel is already a robust single-bin DFT with Hann windowing
+  } else if (!window.trustworthy) {
     // The strict filter rejected this window. Previously this froze the loop
     // for the whole sonication pulse (the frequency never moved). Instead fall
     // back to the best available estimate, bounded to a sane range, so the
@@ -2148,24 +2191,36 @@ void processBodeSweep()
         // Turn off PA5 immediately now that measurement is complete
         sonication::stop();
 
+        // Check Goertzel capture metrics for this frequency point
+        goertzel_capture::GoertzelMetrics gM = goertzel_capture::getMetrics();
+
         float measuredFreq = (cap.refValid && cap.frequencyHz > 1.0f) ? cap.frequencyHz : s_bodeCurrentFreq;
         float phaseNs      = 0.0f;
         float phaseDeg     = 0.0f;
         uint16_t samples   = 0U;
         uint8_t isValid    = 0U;
 
-        if (win.phaseComputed && win.sampleCount >= 2U) {
-          phaseNs  = win.phaseDiffNs;
-          phaseDeg = win.phaseDegrees;
-          samples  = (win.acceptedCount > 0U) ? win.acceptedCount : win.sampleCount;
-          isValid  = 1U;
-        } else if (cap.valid) {
-          phaseNs  = cap.phaseDiffNs;
-          phaseDeg = (measuredFreq > 1.0f) ? (cap.phaseDiffNs * measuredFreq * 360.0e-9f) : 0.0f;
-          while (phaseDeg > 180.0f)  phaseDeg -= 360.0f;
-          while (phaseDeg < -180.0f) phaseDeg += 360.0f;
-          samples  = 1U;
-          isValid  = 1U;
+        if (s_phaseSource == PHASE_SOURCE_GOERTZEL) {
+          if (gM.valid) {
+            phaseNs  = gM.phaseDiffNs;
+            phaseDeg = gM.phaseDiffDeg;
+            samples  = goertzel_capture::N_SAMPLES;
+            isValid  = 1U;
+          }
+        } else {
+          if (win.phaseComputed && win.sampleCount >= 2U) {
+            phaseNs  = win.phaseDiffNs;
+            phaseDeg = win.phaseDegrees;
+            samples  = (win.acceptedCount > 0U) ? win.acceptedCount : win.sampleCount;
+            isValid  = 1U;
+          } else if (cap.valid) {
+            phaseNs  = cap.phaseDiffNs;
+            phaseDeg = (measuredFreq > 1.0f) ? (cap.phaseDiffNs * measuredFreq * 360.0e-9f) : 0.0f;
+            while (phaseDeg > 180.0f)  phaseDeg -= 360.0f;
+            while (phaseDeg < -180.0f) phaseDeg += 360.0f;
+            samples  = 1U;
+            isValid  = 1U;
+          }
         }
 
         s_latestCaptureData = cap;
@@ -2185,16 +2240,18 @@ void processBodeSweep()
         pkt.stepIndex      = s_bodeStepIndex;
         pkt.totalSteps     = s_bodeTotalSteps;
         pkt.sampleCount    = samples;
-        pkt.targetFreqHz   = s_bodeCurrentFreq;
-        pkt.measuredFreqHz = measuredFreq;
-        pkt.phaseDiffNs    = phaseNs;
-        pkt.phaseDegrees   = phaseDeg;
+        pkt.targetFreqHz        = s_bodeCurrentFreq;
+        pkt.measuredFreqHz      = measuredFreq;
+        pkt.phaseDiffNs         = phaseNs;
+        pkt.phaseDegrees        = phaseDeg;
+        pkt.currentMagnitude_mA = gM.currentAmpA * 1000.0f; // Transducer peak current magnitude (mA)
         com::sendPacket(OPCODE_BODE_SWEEP_POINT, 0, (const uint8_t *)&pkt, sizeof(pkt));
 
-        DebugPort.printf("[BODE %u/%u] Target=%.1f Hz | Meas=%.2f Hz | Phase=%.2f deg (%.1f ns) | N=%u %s\n",
+        DebugPort.printf("[BODE %u/%u] Target=%.1f Hz | Meas=%.2f Hz | Phase=%.2f deg (%.1f ns) | I=%.1f mA | N=%u %s\n",
                          (unsigned)s_bodeStepIndex, (unsigned)s_bodeTotalSteps,
                          s_bodeCurrentFreq, measuredFreq, phaseDeg, phaseNs,
-                         (unsigned)samples, isValid ? "OK" : "NO_ZCD");
+                         gM.currentAmpA * 1000.0f,
+                         (unsigned)samples, isValid ? "OK" : "NO_SIGNAL");
 
         if (isLastStep) {
           s_bodePhase = BODE_IDLE;
