@@ -61,6 +61,17 @@ typedef struct BodeSweepPointPacket
     float    phaseDegrees;        // measured phase difference (deg)
     float    currentMagnitude_mA; // measured peak current amplitude (mA)
 } __attribute__((packed)) BodeSweepPointPacket;
+
+typedef struct AdcSnapshotHeader
+{
+    uint8_t  channel;       // 0 = PC4 (Current Waveform), 1 = PA7 (Drive Ref Waveform)
+    uint8_t  reserved;      // padding / reserved
+    uint16_t sampleCount;   // number of 16-bit samples following (e.g. 240)
+    uint32_t sampleRateHz;  // ADC sampling rate (750000 Hz)
+    float    driveFreqHz;   // active drive frequency (Hz)
+    float    vRefVolts;     // mid-scale reference (1.65 V)
+    float    frontEndAtten; // attenuator ratio (e.g. 0.3333f)
+} __attribute__((packed)) AdcSnapshotHeader;
 namespace com
 {
     void begin();

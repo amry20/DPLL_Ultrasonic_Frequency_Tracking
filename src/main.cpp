@@ -640,6 +640,72 @@ void commandProccessor()
         com::sendPacket(OPCODE_GET_PHASE_SOURCE, 0, &src, 1);
         break;
       }
+      case OPCODE_TRIGGER_ADC_SNAPSHOT:
+      {
+        uint16_t curBuf[240];
+        uint16_t refBuf[240];
+        uint16_t actualCount = 0;
+        float driveFreqHz = 0.0f;
+        float frontEndAtten = 0.3333f;
+        if (goertzel_capture::captureSnapshot(curBuf, refBuf, 240, actualCount, driveFreqHz, frontEndAtten))
+        {
+          uint8_t payload[COM_PAYLOAD_MAX_SIZE];
+          AdcSnapshotHeader hdr{};
+          hdr.channel = 0; // 0 = PC4 Current Sense
+          hdr.reserved = 0;
+          hdr.sampleCount = actualCount;
+          hdr.sampleRateHz = 750000;
+          hdr.driveFreqHz = driveFreqHz;
+          hdr.vRefVolts = 1.65f;
+          hdr.frontEndAtten = frontEndAtten;
+
+          // Send Channel 0 (PC4 Current)
+          memcpy(payload, &hdr, sizeof(AdcSnapshotHeader));
+          memcpy(payload + sizeof(AdcSnapshotHeader), curBuf, actualCount * sizeof(uint16_t));
+          com::sendPacket(OPCODE_ADC_SNAPSHOT_DATA, 0, payload, sizeof(AdcSnapshotHeader) + actualCount * sizeof(uint16_t));
+
+          // Send Channel 1 (PA7 Drive Reference)
+          hdr.channel = 1;
+          memcpy(payload, &hdr, sizeof(AdcSnapshotHeader));
+          memcpy(payload + sizeof(AdcSnapshotHeader), refBuf, actualCount * sizeof(uint16_t));
+          com::sendPacket(OPCODE_ADC_SNAPSHOT_DATA, 1, payload, sizeof(AdcSnapshotHeader) + actualCount * sizeof(uint16_t));
+
+          com::FlushTxQueue();
+        }
+        break;
+      }
+      case OPCODE_SET_GOERTZEL_BURDEN:
+        if (plen >= 20)
+        {
+          float rB = 50.0f, cB = 6.8e-9f, lS = 24.0e-3f, ctN = 100.0f, atten = 0.333333f;
+          goertzel_capture::BurdenModel curBm = goertzel_capture::getBurdenModel();
+          float pOff = curBm.phaseOffsetDeg;
+          bool compEn = curBm.burdenCompEnabled;
+          memcpy(&rB,    pl + 0,  4);
+          memcpy(&cB,    pl + 4,  4);
+          memcpy(&lS,    pl + 8,  4);
+          memcpy(&ctN,   pl + 12, 4);
+          memcpy(&atten, pl + 16, 4);
+          if (plen >= 24) memcpy(&pOff, pl + 20, 4);
+          if (plen >= 25) compEn = (pl[24] != 0);
+          goertzel_capture::setBurdenModel(rB, cB, lS, ctN, atten, pOff, compEn);
+          goertzel_capture::BurdenModel bm = goertzel_capture::getBurdenModel();
+          DebugPort.printf("[GOERTZEL] Burden updated: R=%.2f Ohm, C=%.3f nF, L=%.3f mH, CT=1:%.1f, Atten=%.4f, Offset=%.1f deg, Comp=%s\n",
+                           bm.rBurdenOhms, bm.cBurdenFarads * 1e9f, bm.lSecHenries * 1e3f,
+                           bm.ctTurnsRatio, bm.frontEndAtten, bm.phaseOffsetDeg,
+                           bm.burdenCompEnabled ? "ON" : "OFF");
+        }
+        break;
+      case OPCODE_GET_GOERTZEL_BURDEN:
+      {
+        goertzel_capture::BurdenModel bm = goertzel_capture::getBurdenModel();
+        uint8_t buf[25];
+        float vals[6] = { bm.rBurdenOhms, bm.cBurdenFarads, bm.lSecHenries, bm.ctTurnsRatio, bm.frontEndAtten, bm.phaseOffsetDeg };
+        memcpy(buf, vals, 24);
+        buf[24] = bm.burdenCompEnabled ? 1 : 0;
+        com::sendPacket(OPCODE_GET_GOERTZEL_BURDEN, 0, buf, sizeof(buf));
+        break;
+      }
     }
   }
 }
@@ -710,8 +776,11 @@ void sendMonitorStream()
   }
   float currentDacV = dac::lastRaw() * (3.3f / 4095.0f);
 
+  const goertzel_capture::GoertzelMetrics gTel = goertzel_capture::getMetrics();
+  const bool useGoertzel = (s_phaseSource == PHASE_SOURCE_GOERTZEL);
+
   const bool isSignalActive = (s_dpllState != STATE_NO_SIGNAL) || dpll::getManualMode();
-  const bool isPhaseValid   = isSignalActive && data.valid;
+  const bool isPhaseValid   = isSignalActive && (useGoertzel ? gTel.valid : data.valid);
 
   // Phase value reported: prefer robust filtered window phase when active.
   // When idle or at start-up settling, hold clean locked phase (or targetPhase) instead of collapsing to 0 ns.
@@ -742,18 +811,20 @@ void sendMonitorStream()
 
   dpllStatusData status;
   // LockStatus: 0=NO_REF, 1=WAIT_ZCD/ACQUIRING, 2=TRACK, 3=LOCK, 4=MANUAL/OPEN_LOOP
+  const bool refOk  = useGoertzel ? gTel.refValid     : data.refValid;
+  const bool zcdOk  = useGoertzel ? gTel.currentValid : data.zcdPresent;
   if (dpll::getManualMode()) {
     status.LockStatus = 4;
-  } else if (!data.refValid) {
+  } else if (!refOk) {
     status.LockStatus = 0;
-  } else if (!isSignalActive || !data.zcdPresent) {
+  } else if (!isSignalActive || !zcdOk) {
     status.LockStatus = 1;
   } else if (s_dpllState == STATE_LOCKED) {
     status.LockStatus = 3;
   } else {
     status.LockStatus = 2;
   }
-  status.ReferenceFrequencyHz = data.frequencyHz;
+  status.ReferenceFrequencyHz = useGoertzel ? gTel.driveFreqHz : data.frequencyHz;
   status.PhaseError_ns        = currentPhaseNs;
   status.DACVoltage_V         = currentDacV;
   status.CurrentMagnitude_mA  = goertzel_capture::getMetrics().currentAmpA * 1000.0f; // Peak current in mA
@@ -1134,15 +1205,18 @@ void processDPLL()
   }
   (void)pulseStart;
 
-  // Pulse-end glitch guard: when already LOCKED and the window filter had to
-  // fall back (untrusted window), reject sudden large phase jumps (dying ZCD).
-  // Trusted windows are never skipped so PID steps respond immediately every cycle.
-  if (usedFallback)
+  // Pulse-end glitch guard: when using fallback ZCD windows or Goertzel mode,
+  // reject sudden large single-frame phase jumps (e.g. dying-pulse ringdown when
+  // sonication turns OFF mid-block while current amplitude is still >= threshold).
+  // Genuine sustained steps will be accepted once glitchSkipCount reaches 4.
+  if (usedFallback || s_phaseSource == PHASE_SOURCE_GOERTZEL)
   {
     const bool haveGood = (s_goodCount >= 2);
+    const float kMinLockJump = (s_phaseSource == PHASE_SOURCE_GOERTZEL) ? 1000.0f : 600.0f;
+    const float kMinTrackJump = (s_phaseSource == PHASE_SOURCE_GOERTZEL) ? 1500.0f : 1000.0f;
     const float kJumpThr = (s_dpllState == STATE_LOCKED)
-                         ? fmaxf(1.5f * kLockThr, 600.0f)
-                         : fmaxf(2.0f * kLockThr, 1000.0f);
+                         ? fmaxf(1.5f * kLockThr, kMinLockJump)
+                         : fmaxf(2.0f * kLockThr, kMinTrackJump);
     bool glitch = false;
     if (haveGood) {
       glitch = fabsf(filteredPhaseNs - s_lastGoodPhase) > kJumpThr;
@@ -1311,6 +1385,8 @@ void handleDebugCommand(const String &cmd)
     DebugPort.println(F("  ddsfreq <hz>  : set DDS center frequency"));
     DebugPort.println(F("  ddsrange <min> <max> : set DDS tracking limits (Hz)"));
     DebugPort.println(F("  edge [ref 0..2] [zcd 0..2] : set capture edge polarity (0=rising, 1=falling, 2=both)"));
+    DebugPort.println(F("  phasesrc <zcd|goertzel> : select phase measurement source (ZCD PA0/PA1 vs Goertzel PC4/PA7)"));
+    DebugPort.println(F("  snap          : print snapshot summary of PC4 analog waveform"));
   }
   else if (name == "dac")
   {
@@ -1997,6 +2073,65 @@ void handleDebugCommand(const String &cmd)
     else
     {
       DebugPort.println(F("ERR: Usage: dir <0=normal|1=inverted>"));
+    }
+  }
+  else if (name == "phasesrc" || name == "phasesource")
+  {
+    if (arg.length() == 0)
+    {
+      DebugPort.printf("Phase Measurement Source: %s (%u)\n",
+                       s_phaseSource == PHASE_SOURCE_GOERTZEL ? "Goertzel Dual ADC (PC4/PA7)" : "ZCD Input Capture (PA0/PA1)",
+                       (uint8_t)s_phaseSource);
+    }
+    else if (arg == "0" || arg == "zcd")
+    {
+      s_phaseSource = PHASE_SOURCE_ZCD;
+      DebugPort.println(F("Phase Measurement Source set to ZCD Input Capture (PA0/PA1)."));
+    }
+    else if (arg == "1" || arg == "goertzel" || arg == "adc")
+    {
+      s_phaseSource = PHASE_SOURCE_GOERTZEL;
+      DebugPort.println(F("Phase Measurement Source set to Goertzel Dual ADC (PC4/PA7)."));
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Usage: phasesrc <0=zcd|1=goertzel>"));
+    }
+  }
+  else if (name == "snap" || name == "wave")
+  {
+    uint16_t curBuf[240];
+    uint16_t refBuf[240];
+    uint16_t count = 0;
+    float fDrive = 0.0f;
+    float atten = 0.3333f;
+    if (goertzel_capture::captureSnapshot(curBuf, refBuf, 240, count, fDrive, atten))
+    {
+      DebugPort.printf("--- ADC Waveform Snapshot (%u samples @ 750 kSPS, f_drive: %.1f Hz) ---\n", count, fDrive);
+      uint16_t minV = 4095, maxV = 0;
+      uint32_t sumV = 0;
+      for (uint16_t i = 0; i < count; i++) {
+        if (curBuf[i] < minV) minV = curBuf[i];
+        if (curBuf[i] > maxV) maxV = curBuf[i];
+        sumV += curBuf[i];
+      }
+      float avgCounts = (float)sumV / (float)count;
+      float vMin = minV * (3.3f / 4095.0f);
+      float vMax = maxV * (3.3f / 4095.0f);
+      float vMid = avgCounts * (3.3f / 4095.0f);
+      float vPk = (vMax - vMin) * 0.5f;
+      float vBurdenPk = vPk / atten;
+      DebugPort.printf("PC4 (CT Current): Min: %.2fV (%u), Max: %.2fV (%u), Mid/Offset: %.2fV, Peak: %.2fV (Burden: %.2fV pk)\n",
+                       vMin, minV, vMax, maxV, vMid, vPk, vBurdenPk);
+      DebugPort.println(F("First 24 samples (counts):"));
+      for (uint16_t i = 0; i < 24 && i < count; i++) {
+        DebugPort.printf("%u ", curBuf[i]);
+      }
+      DebugPort.println();
+    }
+    else
+    {
+      DebugPort.println(F("ERR: Goertzel capture hardware not running or no data."));
     }
   }
   else

@@ -58,20 +58,55 @@ bool poll(float f_drive);
  */
 GoertzelMetrics getMetrics();
 
+struct BurdenModel {
+    float rBurdenOhms;
+    float cBurdenFarads;
+    float lSecHenries;
+    float ctTurnsRatio;
+    float frontEndAtten;
+    float phaseOffsetDeg;
+    bool  burdenCompEnabled;
+};
+
 /**
  * @brief Configure CT burden model parameters for software phase & amplitude calibration.
  * @param rBurdenOhms Burden resistor (e.g. 50.0 ohms)
  * @param cBurdenFarads Burden parallel capacitance (e.g. 6.8e-9 F)
  * @param lSecHenries Burden secondary inductance (e.g. 24.0e-3 H)
  * @param ctTurnsRatio Turns ratio (e.g. 100.0 for 1:100 CT)
- * @param frontEndAtten Attenuation factor of input divider (e.g. 0.4545 for 10k/(10k+12k))
+ * @param frontEndAtten Attenuation factor of input divider (e.g. 0.333333 for 10k/(20k+10k))
+ * @param phaseOffsetDeg Fixed phase offset in degrees (e.g. 180.0 if CT polarity is inverted)
+ * @param burdenCompEnabled Enable reactive burden compensation (C_burden || L_sec). Default false.
  */
-void setBurdenModel(float rBurdenOhms, float cBurdenFarads, float lSecHenries, float ctTurnsRatio, float frontEndAtten);
+void setBurdenModel(float rBurdenOhms, float cBurdenFarads, float lSecHenries, float ctTurnsRatio, float frontEndAtten, float phaseOffsetDeg = 180.0f, bool burdenCompEnabled = false);
+
+/**
+ * @brief Get the active CT burden model parameters.
+ */
+BurdenModel getBurdenModel();
+
+/**
+ * @brief Restore factory default CT burden model parameters.
+ */
+void resetBurdenModel();
 
 /**
  * @brief Check whether Goertzel capture hardware is initialized and running.
  */
 bool isRunning();
+
+/**
+ * @brief Capture a synchronous snapshot of the latest raw ADC waveform (PC4 current & PA7 drive ref).
+ * Uses edge-triggering around mid-scale (2048) to stabilize display.
+ * @param curOut Array to receive PC4 current sense 12-bit ADC raw samples
+ * @param refOut Array to receive PA7 drive ref 12-bit ADC raw samples (can be nullptr)
+ * @param maxCount Max samples to copy (e.g. 240)
+ * @param actualCount Returns number of samples copied
+ * @param driveFreqHz Returns active drive frequency
+ * @param frontEndAtten Returns input attenuator ratio
+ * @return true if successful
+ */
+bool captureSnapshot(uint16_t* curOut, uint16_t* refOut, uint16_t maxCount, uint16_t& actualCount, float& driveFreqHz, float& frontEndAtten);
 
 } // namespace goertzel_capture
 

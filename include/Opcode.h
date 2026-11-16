@@ -67,4 +67,8 @@ enum Opcode : uint16_t {
   OPCODE_BODE_SWEEP_POINT    = 0x0045,
   OPCODE_SET_PHASE_SOURCE    = 0x0046, // 0 = ZCD (PA0/PA1), 1 = Goertzel Dual ADC (PC4/PA7)
   OPCODE_GET_PHASE_SOURCE    = 0x0047,
+  OPCODE_TRIGGER_ADC_SNAPSHOT = 0x0048, // Host requests raw ADC waveform snapshot
+  OPCODE_ADC_SNAPSHOT_DATA   = 0x0049, // Firmware sends ADC waveform snapshot chunk
+  OPCODE_SET_GOERTZEL_BURDEN = 0x004A, // 5x float32: rBurden(Ohm), cBurden(F), lSec(H), ctTurns, frontEndAtten
+  OPCODE_GET_GOERTZEL_BURDEN = 0x004B, // Returns 5x float32 burden model parameters
 };

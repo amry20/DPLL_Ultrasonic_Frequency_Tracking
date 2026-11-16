@@ -10,6 +10,7 @@
 #include "dds_ad9833.h"
 #include "dac_output.h"
 #include "phase_capture.h"
+#include "goertzel_capture.h"
 #include <string.h>
 #include <math.h>
 
@@ -64,6 +65,15 @@ namespace eeprom_config
         cfg.ddsMaxFreq           = dpll::getDdsMaxFreq();
         cfg.ddsMaxSlew           = dpll::getDdsMaxSlew();
 
+        goertzel_capture::BurdenModel bm = goertzel_capture::getBurdenModel();
+        cfg.rBurdenOhms          = bm.rBurdenOhms;
+        cfg.cBurdenFarads        = bm.cBurdenFarads;
+        cfg.lSecHenries          = bm.lSecHenries;
+        cfg.ctTurnsRatio         = bm.ctTurnsRatio;
+        cfg.frontEndAtten        = bm.frontEndAtten;
+        cfg.phaseOffsetDeg       = bm.phaseOffsetDeg;
+        cfg.burdenCompEnabled    = bm.burdenCompEnabled ? 1 : 0;
+
         // Calculate CRC32 over all fields except the crc32 field itself
         size_t crcLen = offsetof(PackedConfig, crc32);
         cfg.crc32 = calcCrc32(reinterpret_cast<const uint8_t *>(&cfg), crcLen);
@@ -96,14 +106,19 @@ namespace eeprom_config
             return false;
         }
 
-        if (cfg.magic != CONFIG_MAGIC || (cfg.version != 1 && cfg.version != 2 && cfg.version != 3 && cfg.version != 4))
+        if (cfg.magic != CONFIG_MAGIC || (cfg.version < 1 || cfg.version > 5))
         {
             return false;
         }
 
-        size_t crcLen = (cfg.version >= 2) ? offsetof(PackedConfig, crc32) : 56;
+        // Legacy v1..v4 configs had crc32 right after ddsMaxSlew (offsetof rBurdenOhms)
+        size_t crcLen = (cfg.version >= 5) ? offsetof(PackedConfig, crc32)
+                      : (cfg.version >= 2) ? offsetof(PackedConfig, rBurdenOhms)
+                                           : 56;
         uint32_t expectedCrc = calcCrc32(reinterpret_cast<const uint8_t *>(&cfg), crcLen);
-        if (cfg.crc32 != expectedCrc)
+        uint32_t storedCrc = (cfg.version >= 5) ? cfg.crc32
+                           : *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(&cfg) + crcLen);
+        if (storedCrc != expectedCrc)
         {
             return false;
         }
@@ -199,6 +214,24 @@ namespace eeprom_config
         // Ensure DDS output frequency matches the center frequency loaded from EEPROM
         dds::setFrequency((double)dpll::getDdsCenterFreq());
 
+        // Apply Goertzel CT burden model if version >= 5
+        if (cfg.version >= 5)
+        {
+            const bool compEn = (cfg.version >= 6) ? (cfg.burdenCompEnabled != 0) : false;
+            goertzel_capture::setBurdenModel(
+                cfg.rBurdenOhms,
+                cfg.cBurdenFarads,
+                cfg.lSecHenries,
+                cfg.ctTurnsRatio,
+                cfg.frontEndAtten,
+                cfg.phaseOffsetDeg,
+                compEn);
+        }
+        else
+        {
+            goertzel_capture::resetBurdenModel();
+        }
+
         return true;
     }
 
@@ -269,6 +302,7 @@ namespace eeprom_config
         phase_capture::setRefEdge(phase_capture::CAPTURE_RISING);
         phase_capture::setZcdEdge(phase_capture::CAPTURE_RISING);
         dpll::setTrackingDirection(dpll::TRACKING_DIR_NORMAL);
+        goertzel_capture::resetBurdenModel();
 
         return ok;
     }

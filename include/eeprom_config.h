@@ -12,7 +12,7 @@
 namespace eeprom_config
 {
     static constexpr uint32_t CONFIG_MAGIC = 0x44504C31; // "DPL1" in ASCII
-    static constexpr uint16_t CONFIG_VERSION = 4;
+    static constexpr uint16_t CONFIG_VERSION = 6;
     static constexpr uint16_t EEPROM_CONFIG_ADDR = 0x0000;
 
     struct PackedConfig
@@ -41,6 +41,15 @@ namespace eeprom_config
         float    ddsMinFreq;           // Hz
         float    ddsMaxFreq;           // Hz
         float    ddsMaxSlew;           // Hz/s
+        // Version 5: Goertzel CT burden calibration
+        float    rBurdenOhms;          // Ohm
+        float    cBurdenFarads;        // Farad
+        float    lSecHenries;          // Henry
+        float    ctTurnsRatio;         // 1:N turns
+        float    frontEndAtten;        // Input divider ratio (0..1)
+        float    phaseOffsetDeg;       // Fixed phase offset in degrees (-360..360)
+        // Version 6: Optional reactive CT burden compensation toggle
+        uint8_t  burdenCompEnabled;    // 0=Disabled (default), 1=Enabled
         uint32_t crc32;
     } __attribute__((packed));
 

@@ -35,16 +35,21 @@ static DMA_HandleTypeDef s_hdma_adc;
 static TIM_HandleTypeDef s_htim3;
 
 static volatile const uint32_t* s_readyBlock = nullptr;
+// Most recently completed DMA half-block. Unlike s_readyBlock this is NOT
+// cleared by poll(), so snapshots can always read the latest data.
+static volatile const uint32_t* s_lastBlock = nullptr;
 static volatile uint32_t s_dmaBlocksCaptured = 0;
 static bool s_running = false;
 
 // Calibration parameters
-// R_burden = 50.0 ohm, C_burden = 6.8 nF, L_sec = 24 mH, 1:100 CT ratio, input divider = 0.4545 (10k / (10k + 12k))
+// R_burden = 50.0 ohm, C_burden = 6.8 nF, L_sec = 24 mH, 1:100 CT ratio, input divider = 0.3333 (10k / (20k + 10k))
 static float s_rBurden = 50.0f;
 static float s_cBurden = 6.8e-9f;
 static float s_lSec    = 24.0e-3f;
 static float s_ctTurns = 100.0f;
-static float s_frontEndAtten = 0.454545f; // 10k / 22k
+static float s_frontEndAtten = 0.333333f; // 10k / (20k + 10k) for 20k series resistor
+static float s_phaseOffsetDeg = 180.0f;   // 180 deg for inverted CT polarity relative to PA7
+static bool  s_burdenCompEnabled = false; // Optional reactive burden compensation (disabled by default)
 
 static GoertzelMetrics s_latestMetrics{};
 
@@ -70,13 +75,22 @@ extern "C" void DMA2_Stream0_IRQHandler(void)
     if (__HAL_DMA_GET_FLAG(&s_hdma_adc, DMA_FLAG_HTIF0_4)) {
         __HAL_DMA_CLEAR_FLAG(&s_hdma_adc, DMA_FLAG_HTIF0_4);
         s_readyBlock = &s_adcDmaBuf[0];
+        s_lastBlock  = &s_adcDmaBuf[0];
         s_dmaBlocksCaptured++;
     }
     // Full Transfer Complete (Second half ready: s_adcDmaBuf[N_SAMPLES .. 2*N_SAMPLES-1])
     if (__HAL_DMA_GET_FLAG(&s_hdma_adc, DMA_FLAG_TCIF0_4)) {
         __HAL_DMA_CLEAR_FLAG(&s_hdma_adc, DMA_FLAG_TCIF0_4);
         s_readyBlock = &s_adcDmaBuf[N_SAMPLES];
+        s_lastBlock  = &s_adcDmaBuf[N_SAMPLES];
         s_dmaBlocksCaptured++;
+    }
+    // Clear error flags so a transfer/direct-mode error cannot cause an IRQ storm.
+    if (__HAL_DMA_GET_FLAG(&s_hdma_adc, DMA_FLAG_TEIF0_4)) {
+        __HAL_DMA_CLEAR_FLAG(&s_hdma_adc, DMA_FLAG_TEIF0_4);
+    }
+    if (__HAL_DMA_GET_FLAG(&s_hdma_adc, DMA_FLAG_DMEIF0_4)) {
+        __HAL_DMA_CLEAR_FLAG(&s_hdma_adc, DMA_FLAG_DMEIF0_4);
     }
 }
 
@@ -232,7 +246,7 @@ bool poll(float f_drive)
     float cur_s1 = 0.0f, cur_s2 = 0.0f;
     float ref_s1 = 0.0f, ref_s2 = 0.0f;
 
-    bool clipped = false;
+    uint16_t curRailCount = 0;
 
     // Execute Goertzel recurrence for both channels simultaneously in a single cache-friendly pass
     for (uint16_t n = 0; n < N_SAMPLES; n++) {
@@ -240,8 +254,8 @@ bool poll(float f_drive)
         const uint16_t raw_cur = (uint16_t)(pair & 0x0FFFU);
         const uint16_t raw_ref = (uint16_t)((pair >> 16) & 0x0FFFU);
 
-        if (raw_cur <= 5 || raw_cur >= 4090 || raw_ref <= 5 || raw_ref >= 4090) {
-            clipped = true;
+        if (raw_cur <= 5 || raw_cur >= 4090) {
+            curRailCount++;
         }
 
         const float win = s_hannWindow[n];
@@ -261,6 +275,10 @@ bool poll(float f_drive)
         ref_s1 = ref_s0;
     }
 
+    // Only the current channel is checked for clipping: the PA7 drive reference is a
+    // square wave from PA8 that legitimately sits at the rails.
+    const bool clipped = (curRailCount >= 3);
+
     // Final complex vectors (Real & Imaginary)
     const float cur_re = cur_s1 - cosW * cur_s2;
     const float cur_im = sinW * cur_s2;
@@ -279,19 +297,25 @@ bool poll(float f_drive)
     const float cur_phi = atan2f(cur_im, cur_re);
     const float ref_phi = atan2f(ref_im, ref_re);
 
-    // Phase difference (Current vs Drive Reference)
-    float dphi = cur_phi - ref_phi;
+    // Phase difference (Drive Reference minus Current so lagging current = positive phase,
+    // matching ZCD t_ZCD - t_REF convention).
+    float dphi = ref_phi - cur_phi;
     while (dphi >  PI_F) dphi -= TWO_PI_F;
     while (dphi < -PI_F) dphi += TWO_PI_F;
 
-    // Software compensation for CT Burden (R_burden || C_burden || L_sec)
-    // Burden phase shift: phi_burden = -atan(R_burden * (2*pi*f*C - 1/(2*pi*f*L)))
+    // Optional software compensation for CT Burden (R_burden || C_burden || L_sec)
+    // When disabled (default), only resistive burden scaling (1/R_burden) and
+    // fixed phaseOffsetDeg are applied without reactive phase shift.
     const float omegaDrive = TWO_PI_F * f_drive;
-    const float bNet = (omegaDrive * s_cBurden) - (1.0f / (omegaDrive * s_lSec > 1e-6f ? omegaDrive * s_lSec : 1e-6f));
-    const float phiBurdenRad = -atanf(s_rBurden * bNet);
+    float bNet = 0.0f;
+    float phiBurdenRad = 0.0f;
+    if (s_burdenCompEnabled) {
+        bNet = (omegaDrive * s_cBurden) - (1.0f / (omegaDrive * s_lSec > 1e-6f ? omegaDrive * s_lSec : 1e-6f));
+        phiBurdenRad = atanf(s_rBurden * bNet);
+    }
 
-    // Corrected true phase at transducer terminal
-    float trueDphi = dphi - phiBurdenRad;
+    // Corrected true phase at transducer terminal + configurable polarity/offset
+    float trueDphi = dphi - phiBurdenRad + (s_phaseOffsetDeg * (PI_F / 180.0f));
     while (trueDphi >  PI_F) trueDphi -= TWO_PI_F;
     while (trueDphi < -PI_F) trueDphi += TWO_PI_F;
 
@@ -300,10 +324,12 @@ bool poll(float f_drive)
 
     // Transducer Peak Current:
     // V_burden = V_adc_pin / frontEndAtten
-    // I_sec = V_burden * sqrt((1/R)^2 + B_net^2)
+    // I_sec = V_burden * sqrt((1/R)^2 + B_net^2)  (B_net=0 when burden comp disabled)
     // I_primary = I_sec * ctTurns
     const float vBurdenPk = (s_frontEndAtten > 1e-4f) ? (cur_pk_v / s_frontEndAtten) : cur_pk_v;
-    const float yBurdenMag = sqrtf((1.0f / (s_rBurden * s_rBurden)) + (bNet * bNet));
+    const float yBurdenMag = s_burdenCompEnabled
+        ? sqrtf((1.0f / (s_rBurden * s_rBurden)) + (bNet * bNet))
+        : (1.0f / s_rBurden);
     const float iSecPk = vBurdenPk * yBurdenMag;
     const float iPrimaryPkA = iSecPk * s_ctTurns;
 
@@ -334,18 +360,83 @@ GoertzelMetrics getMetrics()
     return s_latestMetrics;
 }
 
-void setBurdenModel(float rBurdenOhms, float cBurdenFarads, float lSecHenries, float ctTurnsRatio, float frontEndAtten)
+void setBurdenModel(float rBurdenOhms, float cBurdenFarads, float lSecHenries, float ctTurnsRatio, float frontEndAtten, float phaseOffsetDeg, bool burdenCompEnabled)
 {
-    if (rBurdenOhms > 0.1f) s_rBurden = rBurdenOhms;
-    if (cBurdenFarads >= 0.0f) s_cBurden = cBurdenFarads;
-    if (lSecHenries > 1e-5f) s_lSec = lSecHenries;
-    if (ctTurnsRatio > 0.1f) s_ctTurns = ctTurnsRatio;
-    if (frontEndAtten > 0.01f && frontEndAtten <= 1.0f) s_frontEndAtten = frontEndAtten;
+    if (std::isfinite(rBurdenOhms) && rBurdenOhms > 0.1f && rBurdenOhms <= 1e6f) s_rBurden = rBurdenOhms;
+    if (std::isfinite(cBurdenFarads) && cBurdenFarads >= 0.0f && cBurdenFarads <= 1.0f) s_cBurden = cBurdenFarads;
+    if (std::isfinite(lSecHenries) && lSecHenries > 1e-6f && lSecHenries <= 100.0f) s_lSec = lSecHenries;
+    if (std::isfinite(ctTurnsRatio) && ctTurnsRatio > 0.1f && ctTurnsRatio <= 100000.0f) s_ctTurns = ctTurnsRatio;
+    if (std::isfinite(frontEndAtten) && frontEndAtten > 0.001f && frontEndAtten <= 1.0f) s_frontEndAtten = frontEndAtten;
+    if (std::isfinite(phaseOffsetDeg) && phaseOffsetDeg >= -360.0f && phaseOffsetDeg <= 360.0f) s_phaseOffsetDeg = phaseOffsetDeg;
+    s_burdenCompEnabled = burdenCompEnabled;
+}
+
+BurdenModel getBurdenModel()
+{
+    return BurdenModel{ s_rBurden, s_cBurden, s_lSec, s_ctTurns, s_frontEndAtten, s_phaseOffsetDeg, s_burdenCompEnabled };
+}
+
+void resetBurdenModel()
+{
+    s_rBurden           = 50.0f;
+    s_cBurden           = 6.8e-9f;
+    s_lSec              = 24.0e-3f;
+    s_ctTurns           = 100.0f;
+    s_frontEndAtten     = 0.333333f;
+    s_phaseOffsetDeg    = 180.0f;
+    s_burdenCompEnabled = false;
 }
 
 bool isRunning()
 {
     return s_running;
+}
+
+bool captureSnapshot(uint16_t* curOut, uint16_t* refOut, uint16_t maxCount, uint16_t& actualCount, float& driveFreqHz, float& frontEndAtten)
+{
+    if (!s_running || s_lastBlock == nullptr || curOut == nullptr) return false;
+
+    const uint32_t* blk = (const uint32_t*)s_lastBlock;
+    driveFreqHz = s_latestMetrics.driveFreqHz;
+    frontEndAtten = s_frontEndAtten;
+
+    uint16_t nSamples = (maxCount > 240) ? 240 : maxCount;
+    if (nSamples > N_SAMPLES) nSamples = N_SAMPLES;
+
+    // Edge trigger search: find rising edge crossing mid-scale (2048) on reference channel
+    // within the first 200 samples so trace is rock-steady on screen
+    uint16_t trigIdx = 0;
+    for (uint16_t i = 1; i < 200 && (i + nSamples) < N_SAMPLES; i++) {
+        uint16_t vPrev = (uint16_t)((blk[i - 1] >> 16) & 0x0FFF);
+        uint16_t vCurr = (uint16_t)((blk[i] >> 16) & 0x0FFF);
+        if (vPrev < 2048 && vCurr >= 2048) {
+            trigIdx = i;
+            break;
+        }
+    }
+
+    // If reference didn't trigger, fallback to current channel edge trigger
+    if (trigIdx == 0) {
+        for (uint16_t i = 1; i < 200 && (i + nSamples) < N_SAMPLES; i++) {
+            uint16_t vPrev = (uint16_t)(blk[i - 1] & 0x0FFF);
+            uint16_t vCurr = (uint16_t)(blk[i] & 0x0FFF);
+            if (vPrev < 2048 && vCurr >= 2048) {
+                trigIdx = i;
+                break;
+            }
+        }
+    }
+
+    for (uint16_t i = 0; i < nSamples; i++) {
+        uint32_t pair = blk[trigIdx + i];
+        curOut[i] = (uint16_t)(pair & 0x0FFF);
+        if (refOut != nullptr) {
+            refOut[i] = (uint16_t)((pair >> 16) & 0x0FFF);
+        }
+    }
+
+    actualCount = nSamples;
+    return true;
 }
 
 } // namespace goertzel_capture
