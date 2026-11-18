@@ -13,7 +13,10 @@
 namespace dma_sqw
 {
     // One ARR value per period in circular buffer (16-bit to match TIM1->ARR).
-    static volatile uint16_t s_arr_buf[N_BUF];
+    static uint16_t s_arr_buf[2][N_BUF];
+    static uint8_t s_arrBank = 0;
+    static uint32_t s_prescalerDivider = 1;
+    static uint32_t s_totalTicks = 0;
 
     static float    s_activeFreq  = 28000.0f;
     static uint32_t s_activeBase  = 0;
@@ -22,47 +25,55 @@ namespace dma_sqw
 
     float getResolution(float freqHz)
     {
-        if (freqHz <= 0.0f) return 0.0f;
-        // Step size ~ f^2 / (F_TIM * N_BUF)
-        return (freqHz * freqHz) / ((float)F_TIM_HZ * (float)N_BUF);
+        DitherPlan plan{};
+        if (!makeDitherPlan(freqHz, plan)) return 0.0f;
+        return freqHz * freqHz * static_cast<float>(plan.divider) /
+               (static_cast<float>(F_TIM_HZ) * N_BUF);
     }
 
     void setFrequency(float freqHz)
     {
-        // Clamp frequency to reasonable operational boundaries for ultrasonic transducers
-        if (freqHz < 1000.0f)   freqHz = 1000.0f;
-        if (freqHz > 100000.0f) freqHz = 100000.0f;
+        DitherPlan plan{};
+        if (!makeDitherPlan(freqHz, plan)) return;
+        if (s_initialized && plan.totalTicks == s_totalTicks &&
+            plan.divider == s_prescalerDivider) return;
 
-        s_activeFreq = freqHz;
-
-        // Total timer ticks across N_BUF periods, rounded to nearest integer
-        double totalTicks = ((double)F_TIM_HZ * (double)N_BUF) / (double)freqHz;
-        uint64_t total = (uint64_t)(totalTicks + 0.5);
-        uint32_t base  = (uint32_t)(total / N_BUF);
-        uint32_t rem   = (uint32_t)(total % N_BUF);
-        uint32_t acc   = 0;
-
-        s_activeBase = base;
-
-        // Bresenham-style spreading: the +1-tick periods are evenly interleaved,
-        // which keeps short-term frequency deviation as small as possible (~6 ns max).
-        // Since ARR = period - 1:
-        //   - base ticks     -> ARR = base - 1
-        //   - base + 1 ticks -> ARR = base
-        for (uint32_t i = 0; i < N_BUF; ++i) {
-            acc += rem;
-            if (acc >= N_BUF) {
-                acc -= N_BUF;
-                s_arr_buf[i] = (uint16_t)base;       // base + 1 ticks
-            } else {
-                s_arr_buf[i] = (uint16_t)(base - 1); // base ticks
-            }
-        }
-
-        // ~50% duty cycle (CCR1 preload takes effect at next update event)
+        const uint8_t nextBank = s_arrBank ^ 1U;
+        for (uint32_t i = 0; i < N_BUF; ++i) s_arr_buf[nextBank][i] = plan.arr[i];
+        __DMB();
         if (s_initialized) {
-            TIM1->CCR1 = (uint16_t)(base / 2);
+            const uint32_t irqState = __get_PRIMASK();
+            __disable_irq();
+            // Hold shadow-register updates while replacing the DMA descriptor.
+            // The counter and current output period keep running throughout.
+            TIM1->CR1 |= TIM_CR1_UDIS;
+            TIM1->DIER &= ~TIM_DIER_UDE;
+            DMA2_Stream5->CR &= ~DMA_SxCR_EN;
+            uint32_t attempts = 1000;
+            while ((DMA2_Stream5->CR & DMA_SxCR_EN) && --attempts) { }
+            if (attempts == 0) {
+                TIM1->DIER |= TIM_DIER_UDE;
+                TIM1->CR1 &= ~TIM_CR1_UDIS;
+                __set_PRIMASK(irqState);
+                return;
+            }
+            DMA2->HIFCR = 0xF40U;
+            DMA2_Stream5->M0AR = reinterpret_cast<uint32_t>(s_arr_buf[nextBank]);
+            DMA2_Stream5->NDTR = N_BUF;
+            TIM1->ARR = plan.arr[0];
+            TIM1->CCR1 = plan.base / 2U;
+            TIM1->PSC = plan.divider - 1U;
+            __DMB();
+            DMA2_Stream5->CR |= DMA_SxCR_EN;
+            TIM1->DIER |= TIM_DIER_UDE;
+            TIM1->CR1 &= ~TIM_CR1_UDIS;
+            __set_PRIMASK(irqState);
         }
+        s_arrBank = nextBank;
+        s_activeBase = plan.base;
+        s_prescalerDivider = plan.divider;
+        s_totalTicks = plan.totalTicks;
+        s_activeFreq = plan.frequency;
     }
 
     float getFrequency()
@@ -131,10 +142,10 @@ namespace dma_sqw
         // 3. Compute initial dither buffer
         setFrequency(initialFreqHz);
 
-        // 4. TIM1 Setup: PWM Mode 1 on CH1, PSC = 0 (168 MHz tick)
+        // 4. TIM1 Setup: PWM Mode 1 on CH1, adaptive prescaler (PSC=0 at ultrasonic frequencies)
         TIM1->CR1   = 0;
-        TIM1->PSC   = 0;
-        TIM1->ARR   = s_arr_buf[0];
+        TIM1->PSC   = s_prescalerDivider - 1U;
+        TIM1->ARR   = s_arr_buf[s_arrBank][0];
         TIM1->CCR1  = (uint16_t)(s_activeBase / 2);
         TIM1->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos)   // PWM Mode 1
                     | TIM_CCMR1_OC1PE;            // CCR1 Preload Enable
@@ -149,7 +160,7 @@ namespace dma_sqw
         DMA2->HIFCR = 0xF40U;                      // Clear all Stream 5 flags (bits 6, 8..11)
 
         DMA2_Stream5->PAR  = (uint32_t)&TIM1->ARR; // Destination: Timer ARR register
-        DMA2_Stream5->M0AR = (uint32_t)s_arr_buf;  // Source: RAM dither buffer
+        DMA2_Stream5->M0AR = (uint32_t)s_arr_buf[s_arrBank];  // Source: RAM dither buffer
         DMA2_Stream5->NDTR = N_BUF;
         DMA2_Stream5->CR   = (6U << DMA_SxCR_CHSEL_Pos) // Channel 6
                            | DMA_SxCR_PL_1              // High priority

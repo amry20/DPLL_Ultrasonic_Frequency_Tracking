@@ -18,9 +18,11 @@
  *   *   - Payload variable length
  */
 #include <Arduino.h>
-#include "Opcode.h"
+#include "opcode.h"
 #define COM_HEADER_SIZE 8
 #define COM_PAYLOAD_MAX_SIZE 512
+// Storage includes one trailing checksum byte; wire data may use at most 511.
+#define COM_DATA_MAX_SIZE (COM_PAYLOAD_MAX_SIZE - 1)
 #define START_BYTE 0xAA
 #define END_BYTE 0xBB
 typedef struct ComHeader
@@ -77,6 +79,7 @@ namespace com
     void begin();
     void receive_command();
     // Build a ComPacket from the given fields and push it onto the TX queue.
+    // Data payload limit is COM_DATA_MAX_SIZE (checksum is appended internally).
     // Returns true if the packet was queued, false if the payload is too large
     // or the queue is full.
     bool sendPacket(uint16_t opcode, uint16_t address,

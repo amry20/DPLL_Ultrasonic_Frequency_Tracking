@@ -106,7 +106,7 @@ namespace eeprom_config
             return false;
         }
 
-        if (cfg.magic != CONFIG_MAGIC || (cfg.version < 1 || cfg.version > 5))
+        if (cfg.magic != CONFIG_MAGIC || (cfg.version < 1 || cfg.version > CONFIG_VERSION))
         {
             return false;
         }

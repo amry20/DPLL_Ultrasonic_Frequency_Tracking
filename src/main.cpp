@@ -72,6 +72,7 @@ enum PhaseSource : uint8_t {
   PHASE_SOURCE_GOERTZEL = 1  // Dual Simultaneous ADC on PC4 (Current) & PA7 (Drive Ref)
 };
 static PhaseSource s_phaseSource = PHASE_SOURCE_GOERTZEL; // Default to robust Goertzel front-end
+void setPhaseSource(PhaseSource source);
 
 void setup()
 {
@@ -158,6 +159,7 @@ void setup()
   // PA1 = ZCD feedback input (Rising/Falling/Both edge trigger from configuration)
   // zcdTimeoutMs is set to 30 ms to avoid false signal-loss dropouts during sonication.
   phase_capture::begin(PA0, PA1, phase_capture::getRefEdge(), phase_capture::getZcdEdge(), 30);
+  phase_capture::setEnabled(s_phaseSource == PHASE_SOURCE_ZCD);
 }
 
 void loop()
@@ -207,11 +209,13 @@ void commandProccessor()
   {
     const uint16_t opcode = RxPacket.header.opcode;
     const uint8_t *pl = RxPacket.payload;
-    const uint16_t plen = RxPacket.header.payloadLength; // includes checksum byte
+    const uint16_t plen = RxPacket.header.payloadLength - 1U; // data bytes, excludes checksum
 
     // Debug: print every incoming opcode so we can see what the host sends.
     // Useful when debugging "no data" issues over the debug port (serial monitor).
+#ifdef DEBUG_COM_RX
     DebugPort.printf("[RX] opcode=0x%04X len=%u\n", opcode, plen);
+#endif
 
     // Payload helpers (little-endian, host sends the same layout).
     auto payloadFloat = [&]() -> float {
@@ -239,7 +243,7 @@ void commandProccessor()
       case OPCODE_GET_VERSION:
       {
         // Null-terminated version string — the DAQ parser reads until '\0'.
-        const char *version = "DPLL v2.0.0";
+        const char *version = "DPLL v2.0.1";
         com::sendPacket(OPCODE_GET_VERSION, 0, (const uint8_t *)version, strlen(version) + 1);
         break;
       }
@@ -509,7 +513,7 @@ void commandProccessor()
         if (plen >= 4)
         {
           float f = payloadFloat();
-          if (f >= 1.0f && f <= 500000.0f)
+          if (dma_sqw::isSupportedFrequency(f))
           {
             dpll::setManualMode(true);
             dpll::manualSetFreq(f);
@@ -629,7 +633,7 @@ void commandProccessor()
         if (plen >= 1)
         {
           uint8_t src = pl[0];
-          s_phaseSource = (src == 0) ? PHASE_SOURCE_ZCD : PHASE_SOURCE_GOERTZEL;
+          setPhaseSource((src == 0) ? PHASE_SOURCE_ZCD : PHASE_SOURCE_GOERTZEL);
           DebugPort.printf("[DPLL] Phase Measurement Source set to: %s\n",
                            s_phaseSource == PHASE_SOURCE_GOERTZEL ? "Goertzel Dual ADC (PC4/PA7)" : "ZCD Input Capture (PA0/PA1)");
         }
@@ -757,6 +761,17 @@ static phase_capture::CaptureData s_latestCaptureData{};
 static float s_latestFilteredPhaseNs = 0.0f;
 static bool  s_haveFilteredPhase     = false;
 static float s_holdPhaseNs           = 0.0f;
+
+void setPhaseSource(PhaseSource source)
+{
+  if (source == s_phaseSource) return;
+  s_phaseSource = source;
+  phase_capture::setEnabled(source == PHASE_SOURCE_ZCD);
+  phase_capture::resetFilterState();
+  s_latestCaptureData = {};
+  s_haveFilteredPhase = false;
+  s_dpllState = STATE_NO_SIGNAL;
+}
 
 // Fixed-rate monitor stream — runs independently of the settling window.
 // Rate is set by dpll::getStreamPeriodMs() (default 100 ms = 10 Hz).
@@ -984,7 +999,8 @@ void processDPLL()
   float dt = static_cast<float>(nowMs - lastDacUpdate) * 0.001f;
   phase_capture::CaptureData data = phase_capture::getData();
   s_latestCaptureData = data;
-  phase_capture::PhaseWindowData window = phase_capture::consumeWindowData();
+  phase_capture::PhaseWindowData window{};
+  if (s_phaseSource == PHASE_SOURCE_ZCD) window = phase_capture::consumeWindowData();
   const float kLockThr = dpll::getLockThresholdNs();
 
   // Signal validation based on selected measurement source
@@ -1506,14 +1522,14 @@ void handleDebugCommand(const String &cmd)
   else if (name == "fixed" || name == "test")
   {
     float f = arg.toFloat();
-    if (f >= 1.0f && f <= 500000.0f)
+    if (dma_sqw::isSupportedFrequency(f))
     {
       dpll::manualSetFreq(f);
       DebugPort.printf("Fixed test frequency set to %.2f Hz (loop disabled)\n", f);
     }
     else
     {
-      DebugPort.println("ERR: Frequency must be 1.0 - 500000.0 Hz");
+      DebugPort.println("ERR: Frequency must be 1000 - 100000 Hz");
     }
   }
   else if (name == "loss")
@@ -1824,7 +1840,7 @@ void handleDebugCommand(const String &cmd)
       else
       {
         double f = strtod(subArg.c_str(), nullptr);
-        if (f >= 1.0 && f <= 500000.0)
+        if (dma_sqw::isSupportedFrequency(static_cast<float>(f)))
         {
           dpll::setManualMode(true);
           dpll::manualSetFreq((float)f);
@@ -1832,7 +1848,7 @@ void handleDebugCommand(const String &cmd)
         }
         else
         {
-          DebugPort.println(F("ERR: Frequency out of range (1.0 to 500000.0 Hz)"));
+          DebugPort.println(F("ERR: Frequency out of range (1000 to 100000 Hz)"));
         }
       }
     }
@@ -1960,12 +1976,12 @@ void handleDebugCommand(const String &cmd)
       DebugPort.printf("Active Src: %s\n", (dpll::getGeneratorSource() == dpll::GENERATOR_SOURCE_PWM_DITHER) ? "YES (ACTIVE TRACKER)" : "NO");
       DebugPort.printf("Frequency : %.2f Hz\n", dma_sqw::getFrequency());
       DebugPort.printf("Resolution: %.4f Hz (at %.0f Hz)\n", dma_sqw::getResolution(dma_sqw::getFrequency()), dma_sqw::getFrequency());
-      DebugPort.printf("Dither Buf: %u entries (168 MHz APB2 timer clock, PSC=0)\n", dma_sqw::N_BUF);
+      DebugPort.printf("Dither Buf: %u entries (168 MHz APB2 timer clock, adaptive PSC)\n", dma_sqw::N_BUF);
     }
     else if (subCmd == "freq")
     {
       float f = subArg.toFloat();
-      if (f >= 1000.0f && f <= 100000.0f)
+      if (dma_sqw::isSupportedFrequency(f))
       {
         dpll::manualSetFreq(f);
         DebugPort.printf("PWM Dither Frequency manually set to: %.2f Hz (Loop paused)\n", f);
@@ -2085,12 +2101,12 @@ void handleDebugCommand(const String &cmd)
     }
     else if (arg == "0" || arg == "zcd")
     {
-      s_phaseSource = PHASE_SOURCE_ZCD;
+      setPhaseSource(PHASE_SOURCE_ZCD);
       DebugPort.println(F("Phase Measurement Source set to ZCD Input Capture (PA0/PA1)."));
     }
     else if (arg == "1" || arg == "goertzel" || arg == "adc")
     {
-      s_phaseSource = PHASE_SOURCE_GOERTZEL;
+      setPhaseSource(PHASE_SOURCE_GOERTZEL);
       DebugPort.println(F("Phase Measurement Source set to Goertzel Dual ADC (PC4/PA7)."));
     }
     else
@@ -2209,8 +2225,8 @@ bool isBodeSweepActive()
 
 void startBodeSweep(float startFreq, float stopFreq, float stepFreq, uint32_t pulseOnMs, uint32_t restGapMs)
 {
-  if (isnan(startFreq) || isnan(stopFreq) || isnan(stepFreq) ||
-      startFreq < 1000.0f || stopFreq > 500000.0f || stopFreq < startFreq || stepFreq < 0.5f)
+  if (!dma_sqw::isSupportedFrequency(startFreq) || !dma_sqw::isSupportedFrequency(stopFreq) ||
+      !isfinite(stepFreq) || stopFreq < startFreq || stepFreq < 0.5f)
   {
     DebugPort.println(F("[BODE] Invalid sweep parameters"));
     return;
@@ -2320,7 +2336,8 @@ void processBodeSweep()
       if (elapsedMs >= effectivePulseMs) {
         // Consume phase window while PA5 is still HIGH (before dying-pulse ringdown)
         phase_capture::CaptureData cap = phase_capture::getData();
-        phase_capture::PhaseWindowData win = phase_capture::consumeWindowData();
+        phase_capture::PhaseWindowData win{};
+        if (s_phaseSource == PHASE_SOURCE_ZCD) win = phase_capture::consumeWindowData();
         phase_capture::clearWindowData();
 
         // Turn off PA5 immediately now that measurement is complete

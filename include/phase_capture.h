@@ -53,7 +53,7 @@ struct PhaseWindowData {
   float    outlierRatio;      // Fraction of samples rejected [0, 1]
   uint16_t sampleCount;       // Paired REF/ZCD samples captured in this window
   uint16_t acceptedCount;     // Samples retained by the robust estimator
-  bool     overflow;          // Sample bank filled before the window ended
+  bool     overflow;          // Oldest samples discarded; newest samples retained
   bool     largeShift;        // Large intra/inter-window phase movement detected
   bool     trustworthy;       // Safe to feed this estimate to the PID
   bool     phaseComputed;     // phaseDiffNs holds a usable (maybe untrusted) estimate
@@ -70,6 +70,9 @@ void begin(uint32_t refPin  = PA0,
            EdgePolarity refEdge = CAPTURE_RISING,
            EdgePolarity zcdEdge = CAPTURE_RISING,
            uint32_t zcdTimeoutMs = 50);
+
+// Enable capture only when ZCD is the selected phase source.
+void setEnabled(bool enabled);
 
 // Set ZCD timeout in milliseconds
 void setZcdTimeout(uint32_t timeoutMs);

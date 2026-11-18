@@ -7,7 +7,7 @@
  * Drive reference: PA7 (ADC2_IN7)  - from PA8 TIM1 PWM via RC filter (1k + 1nF)
  *
  * Sampling: 750 kSPS triggered by TIM3 TRGO.
- * DMA:      DMA2 Stream 0 Channel 0 in circular mode, 2x1024 sample pairs.
+ * DMA:      DMA2 Stream 0 Channel 0 in circular mode, two 1024-pair DMA targets and two ownership buffers.
  * Method:   Single-bin Goertzel DFT with Hann windowing at f_drive.
  */
 
@@ -32,7 +32,9 @@ struct GoertzelMetrics {
     float phaseDiffDeg;      // Phase difference (degrees)
     float phaseDiffNs;       // Phase difference in time (nanoseconds)
     float driveFreqHz;       // Frequency at which Goertzel was computed
-    uint32_t blockCount;     // Incremented every completed block
+    uint32_t blockCount;     // Sequence of this processed block
+    uint32_t capturedAtMs;   // DMA completion timestamp; used to reject stale metrics
+    uint32_t droppedBlocks; // Completed blocks replaced before the main loop acquired them
     bool  refValid;          // True if refAmpV > threshold (~0.2 V)
     bool  currentValid;      // True if currentAmpV > threshold and not clipped
     bool  clipped;           // True if either channel saturated ADC rails
@@ -96,7 +98,7 @@ void resetBurdenModel();
 bool isRunning();
 
 /**
- * @brief Capture a synchronous snapshot of the latest raw ADC waveform (PC4 current & PA7 drive ref).
+ * @brief Capture a synchronous snapshot of the latest CPU-owned raw ADC waveform (PC4 current & PA7 drive ref).
  * Uses edge-triggering around mid-scale (2048) to stabilize display.
  * @param curOut Array to receive PC4 current sense 12-bit ADC raw samples
  * @param refOut Array to receive PA7 drive ref 12-bit ADC raw samples (can be nullptr)

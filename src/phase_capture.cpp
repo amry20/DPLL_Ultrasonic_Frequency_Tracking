@@ -14,6 +14,7 @@ namespace phase_capture {
 namespace {
 
 HardwareTimer* s_timer = nullptr;
+bool s_captureEnabled = true;
 
 uint32_t s_refPin = PA0;
 uint32_t s_zcdPin = PA1;
@@ -93,6 +94,7 @@ struct PhaseSample {
 // Placed in CCMRAM for fast core access without consuming DMA-capable bus matrix SRAM.
 __attribute__((section(".ccmram"))) static PhaseSample s_sampleBanks[2][kMaxWindowSamples]{};
 volatile uint16_t s_bankCount[2]    = {0, 0};
+volatile uint16_t s_bankNext[2]     = {0, 0};
 volatile bool     s_bankOverflow[2] = {false, false};
 volatile uint8_t  s_activeBank      = 0;
 
@@ -153,24 +155,30 @@ void storePhaseSampleFromIsr(uint32_t zcdCapture)
   const int32_t period = static_cast<int32_t>(s_periodTicks);
   const int32_t halfPeriod = period / 2;
 
-  while (diff > halfPeriod) diff -= period;
-  while (diff < -halfPeriod) diff += period;
+  // REF may stop while ZCD continues. Reject old pairs before wrapping, and
+  // keep ISR work constant even across long outages or timer rollover.
+  const int32_t maxPairAge = static_cast<int32_t>(kZcdMaxAgePeriods) * period;
+  if (diff > maxPairAge || diff < -maxPairAge) {
+    s_haveSynchronizedDiff = false;
+    return;
+  }
+  diff %= period;
+  if (diff > halfPeriod) diff -= period;
+  if (diff < -halfPeriod) diff += period;
 
   // Save atomically paired difference for instant snapshot reads in getData()
   s_lastSynchronizedDiff = diff;
   s_haveSynchronizedDiff = true;
 
   const uint8_t bank = s_activeBank;
-  const uint16_t index = s_bankCount[bank];
-  if (index >= kMaxWindowSamples) {
-    s_bankOverflow[bank] = true;
-    return;
-  }
-
+  const uint16_t index = s_bankNext[bank];
   s_sampleBanks[bank][index].phaseTicks = diff;
   s_sampleBanks[bank][index].periodTicks = s_periodTicks;
   s_sampleBanks[bank][index].timestampTicks = zcdCapture;
-  s_bankCount[bank] = static_cast<uint16_t>(index + 1U);
+  s_bankNext[bank] = static_cast<uint16_t>((index + 1U) % kMaxWindowSamples);
+  if (s_bankCount[bank] < kMaxWindowSamples) ++s_bankCount[bank];
+  else s_bankOverflow[bank] = true; // Discard oldest; retain a fresh chronological tail.
+
 }
 
 TimerModes_t toTimerMode(EdgePolarity edge)
@@ -198,6 +206,16 @@ void onRefCapture()
   }
 
   uint32_t delta = cap - s_lastRefCapture;
+  // Bound the accepted reference periods to 100 Hz..500 kHz. A long gap
+  // starts acquisition afresh instead of contaminating the 64-cycle history.
+  if (s_captureCount > 0 && delta > 840000U) {
+    s_captureCount = 0;
+    s_refAvgCount = 0;
+    s_refCapHead = 0;
+    s_totalPeriodTicks64 = 0;
+    s_refValid = false;
+    s_haveSynchronizedDiff = false;
+  }
 
   // Minimum period guard: At 84 MHz, 100 kHz is 840 ticks. 500 kHz is 168 ticks.
   // If delta < 168 ticks (< 2 us, > 500 kHz), it's either an 8 MHz MCO clock accidentally
@@ -275,6 +293,7 @@ void begin(uint32_t refPin, uint32_t zcdPin, EdgePolarity refEdge, EdgePolarity 
   }
 
   s_timer = new HardwareTimer(TIM2);
+  s_timer->setInterruptPriority(6, 0); // ADC DMA (priority 5) must be serviced first.
 
   // Configure 32-bit timer: prescaler = 1 (full 84 MHz count speed)
   s_timer->setPrescaleFactor(1);
@@ -310,12 +329,34 @@ void begin(uint32_t refPin, uint32_t zcdPin, EdgePolarity refEdge, EdgePolarity 
   s_activeBank   = 0;
   s_bankCount[0] = 0;
   s_bankCount[1] = 0;
+  s_bankNext[0] = s_bankNext[1] = 0;
   s_bankOverflow[0] = false;
   s_bankOverflow[1] = false;
   s_haveTrustedWindow = false;
   s_haveShiftCandidate = false;
   s_shiftCandidateSinceMs = 0;
   s_timer->resume();
+  s_captureEnabled = true;
+}
+
+void setEnabled(bool enabled)
+{
+  if (!s_timer || enabled == s_captureEnabled) return;
+  const uint32_t irqState = __get_PRIMASK();
+  __disable_irq();
+  s_timer->pause();
+  s_captureEnabled = enabled;
+  s_captureCount = s_zcdCount = 0;
+  s_refAvgCount = s_refCapHead = 0;
+  s_totalPeriodTicks64 = s_periodTicks = 0;
+  s_lastRefMs = s_lastZcdMs = 0;
+  s_refValid = false;
+  s_bankCount[0] = s_bankCount[1] = 0;
+  s_bankNext[0] = s_bankNext[1] = 0;
+  s_bankOverflow[0] = s_bankOverflow[1] = false;
+  resetFilterState();
+  if (enabled) s_timer->resume();
+  __set_PRIMASK(irqState);
 }
 
 void setZcdTimeout(uint32_t timeoutMs)
@@ -341,6 +382,7 @@ void setRefEdge(EdgePolarity edge)
     s_timer->setMode(1, toTimerMode(s_refEdge), s_refPin);
     GPIOA->PUPDR = (GPIOA->PUPDR & ~(3U << (0 * 2))) | (2U << (0 * 2));
     TIM2->CCMR1 |= (3U << TIM_CCMR1_IC1F_Pos);
+    if (!s_captureEnabled) s_timer->pause();
   }
 }
 
@@ -351,6 +393,7 @@ void setZcdEdge(EdgePolarity edge)
     s_timer->setMode(2, toTimerMode(s_zcdEdge), s_zcdPin);
     GPIOA->PUPDR = (GPIOA->PUPDR & ~(3U << (1 * 2))) | (2U << (1 * 2));
     TIM2->CCMR1 |= (3U << TIM_CCMR1_IC2F_Pos);
+    if (!s_captureEnabled) s_timer->pause();
   }
 }
 
@@ -367,6 +410,7 @@ EdgePolarity getZcdEdge()
 CaptureData getData()
 {
   CaptureData out{};
+  if (!s_captureEnabled) return out;
 
   uint32_t lastZcdMs = 0;
   uint32_t lastRefMs = 0;
@@ -400,7 +444,10 @@ CaptureData getData()
       out.zcdPresent = false;
     }
   }
-  out.refValid   = s_refValid && (lastRefMs > 0) && ((now - lastRefMs) <= s_refTimeoutMs);
+  out.refValid = out.refValid && (lastRefMs > 0) &&
+                 ((now - lastRefMs) <= s_refTimeoutMs) &&
+                 (out.periodTicks != 0) &&
+                 ((nowTicks - out.refTimestamp) <= kZcdMaxAgePeriods * out.periodTicks);
   out.valid      = out.refValid && out.zcdPresent;
 
   if (!out.refValid || out.periodTicks == 0) {
@@ -471,10 +518,12 @@ PhaseWindowData consumeWindowData()
   const uint8_t processingBank = s_activeBank;
   const uint8_t newActiveBank = static_cast<uint8_t>(processingBank ^ 1U);
   s_bankCount[newActiveBank] = 0;
+  s_bankNext[newActiveBank] = 0;
   s_bankOverflow[newActiveBank] = false;
   s_activeBank = newActiveBank;
   const uint16_t sampleCount = s_bankCount[processingBank];
   const bool overflow = s_bankOverflow[processingBank];
+  const uint16_t nextIndex = s_bankNext[processingBank];
   interrupts();
 
   result.sampleCount = sampleCount;
@@ -484,7 +533,12 @@ PhaseWindowData consumeWindowData()
     return result;
   }
 
-  const PhaseSample* samples = s_sampleBanks[processingBank];
+  // A long window is a ring of the most recent samples, never a stale prefix.
+  // Reorder only the closed bank; interrupts continue writing to the other bank.
+  PhaseSample* samples = s_sampleBanks[processingBank];
+  if (overflow && nextIndex != 0) {
+    std::rotate(samples, samples + nextIndex, samples + sampleCount);
+  }
 
   // Convert each paired capture to phase angle. Using angle rather than raw
   // nanoseconds keeps the filter threshold independent of drive frequency.
@@ -665,7 +719,7 @@ PhaseWindowData consumeWindowData()
   result.phaseComputed = true;
 
   // Window is trustworthy if sample count and fit metrics pass. Reaching buffer
-  // capacity on long loop periods (overflow) does not invalidate the captured samples.
+  // capacity on long loop periods retains the newest samples in the ring.
   bool locallyTrustworthy =
       sampleCount >= kMinWindowSamples &&
       acceptedBlocks >= kMinAcceptedBlocks &&
@@ -717,6 +771,7 @@ void clearWindowData()
   noInterrupts();
   const uint8_t bank = s_activeBank;
   s_bankCount[bank] = 0;
+  s_bankNext[bank] = 0;
   s_bankOverflow[bank] = false;
   interrupts();
 }

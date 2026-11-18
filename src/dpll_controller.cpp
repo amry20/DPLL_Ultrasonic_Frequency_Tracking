@@ -183,7 +183,7 @@ float getDdsCenterFreq()
 
 void setDdsCenterFreq(float freqHz)
 {
-  if (freqHz >= 1000.0f && freqHz <= 500000.0f) {
+  if (dma_sqw::isSupportedFrequency(freqHz)) {
     s_ddsCenterFreq = freqHz;
     s_outputFreq = s_ddsCenterFreq;
     s_haveLockedCenter = false;
@@ -208,7 +208,7 @@ float getDdsMaxFreq()
 
 void setDdsFreqLimits(float minHz, float maxHz)
 {
-  if (minHz >= 1000.0f && maxHz > minHz && maxHz <= 500000.0f) {
+  if (dma_sqw::isSupportedFrequency(minHz) && maxHz > minHz && dma_sqw::isSupportedFrequency(maxHz)) {
     s_ddsMinFreq = minHz;
     s_ddsMaxFreq = maxHz;
     if (s_outputFreq < s_ddsMinFreq) s_outputFreq = s_ddsMinFreq;
@@ -552,14 +552,13 @@ void manualSet(float voltage)
 
 void manualSetFreq(float freqHz)
 {
+  if (!dma_sqw::isSupportedFrequency(freqHz)) return;
   s_manualMode = true;
   s_enabled = false;
   s_integral = 0.0f;
   if (!isFrequencyGenerator()) {
     s_generatorSource = GENERATOR_SOURCE_PWM_DITHER;
   }
-  if (freqHz < 1000.0f) freqHz = 1000.0f;
-  if (freqHz > 500000.0f) freqHz = 500000.0f;
   s_outputFreq = freqHz;
   dac::setVoltage(1.65f); // Park DAC safely at 1.65 V neutral
   if (s_generatorSource == GENERATOR_SOURCE_PWM_DITHER) {

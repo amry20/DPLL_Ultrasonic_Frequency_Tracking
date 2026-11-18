@@ -9,3 +9,25 @@ in the development cycle.
 
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+Native regression checks (Zig C++ compiler required):
+    python test/run_native.py --compiler <path-to-zig>
+
+These compile the production USB parser and phase estimator with fake I/O,
+exercise partial/malformed/max-size packets and USB backpressure, stress DMA
+buffer ownership with delayed consumers, and validate PWM periods over 1-100 kHz.
+The ZCD checks include REF loss, timer rollover and long capture windows.
+
+Firmware build and ST-Link programming:
+    pio run
+    pio run --target upload
+
+On hardware, verify the ADC block counter continues increasing (about 732/s),
+no ADC/DMA error is set, the selected capture source matches TIM2 enable state,
+and the host can still read configuration/status and dual-channel snapshots.
+
+USB smoke checks after upload (pyserial required, sonication remains off):
+    python test/hardware_usb_smoke.py --port COM20
+
+Checks firmware version, maximum-size frames, recovery after truncation, and
+both 240-sample ADC waveform packets. Close the DAQ connection before running.
